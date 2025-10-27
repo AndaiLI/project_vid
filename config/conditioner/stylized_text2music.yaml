@@ -1,0 +1,19 @@
+# @package _global_
+
+defaults:
+  - text2music
+  - _self_
+
+conditioner:
+  style:
+    model: mert_style_conditioner
+    mert_style_conditioner:
+      model_path: m-a-p/MERT-v1-95M
+      embedding_dim: 768
+
+# --- THE DEFINITIVE, EXPLICIT FIX ---
+fuser:
+  # We are not appending, we are re-defining the entire list.
+  # This list now contains both the original value from text2music.yaml
+  # and our new value.
+  cross: [description, style]
