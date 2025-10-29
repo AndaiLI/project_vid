@@ -12,7 +12,7 @@ import torchaudio
 
 from ..utils import utils
 from ..modules.streaming import StreamingModule, State
-from ..modules.transformer import StreamingTransformer, create_norm_fn, StreamingTransformerLayer 
+from ..modules.transformer import StreamingTransformer, create_norm_fn, StreamingTransformerLayer, MultimodalInjectionLayer
 
 import time
 from ..modules.conditioners import (
@@ -257,9 +257,36 @@ class LMModel(StreamingModule):
         self.emb = nn.ModuleList([ScaledEmbedding(embed_dim, dim, lr=emb_lr) for _ in range(n_q)])
         if 'activation' in kwargs:
             kwargs['activation'] = get_activation_fn(kwargs['activation'])
+
+        if self.audio_encoder == 'mert':
+            mert_model_id = "m-a-p/MERT-v1-95M" 
+            self.audio_encoder_model = AutoModel.from_pretrained(mert_model_id,trust_remote_code=True)
+            self.audio_processor = AutoFeatureExtractor.from_pretrained(mert_model_id,trust_remote_code=True)
+        else:
+            print(f'the audio encoder now is:{self.audio_encoder}')
+            print(f'please input the right audio encoder.')
+            exit()
+            
+        if self.audio_encoder == 'mert':
+            audio_feature_dim = self.audio_encoder_model.config.hidden_size # MERT-95M 的 hidden_size 是 768
+            self.audio_encoder_model = self.audio_encoder_model.eval()
+            for param in self.audio_encoder_model.parameters():
+                param.requires_grad = False
+
+        self.audio_style_processor = Transformer(
+            audio_feature_dim, depth, num_heads, dim_head, audio_feature_dim * hidden_scale, 0.
+        )
+        self.audio_feature_proj = nn.Linear(audio_feature_dim, dim)
+
+
+        mert_dim = self.audio_encoder_model.config.hidden_size
+        kwargs['mert_dim'] = mert_dim 
+        
         self.transformer = StreamingTransformer(
             d_model=dim, num_heads=num_heads, dim_feedforward=int(hidden_scale * dim),
-            norm=norm, norm_first=norm_first, **kwargs)
+            norm=norm, norm_first=norm_first, 
+            layer_class=MultimodalInjectionLayer,
+            **kwargs) 
         
         
         self.out_norm: tp.Optional[nn.Module] = None
@@ -270,12 +297,12 @@ class LMModel(StreamingModule):
         self._fsdp: tp.Optional[nn.Module]
         self.__dict__['_fsdp'] = None
         
+
+
+
         # 1. == 根据配置加载一个预训练的视觉编码器 ==
-        # 这里添加clip，并对视频特征进行处理，包括transformer时序建模，交叉注意特征融合
         if self.visual_encoder == 'clip':
-            # 加载 OpenAI 的 CLIP 模型，这是一个强大的图像-文本预训练模型
             self.visual_encoder_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
-            # 加载相应的预处理器
             self.processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
                              
         else:
@@ -284,8 +311,6 @@ class LMModel(StreamingModule):
             exit()
         
         # 2. == 冻结视觉编码器 ==
-        #    这是非常关键的一步。视觉编码器作为特征提取器使用，其权重在训练中保持不变。
-        #    这可以节省大量计算资源，并利用 CLIP 强大的预训练知识。
         if self.visual_encoder == 'clip':
             temporal_dim = 768 
             self.local_pos_embedding = nn.Parameter(torch.randn(1, 50, temporal_dim))
@@ -301,90 +326,14 @@ class LMModel(StreamingModule):
             if self.visual_encoder == 'clip':
                 self.global_pos_embedding = nn.Parameter(torch.randn(1, 50, temporal_dim))
 
-           # 4a. 创建一个独立的 Transformer 来处理 "全局" 视频的时序信息
             self.global_temporal_transformer = Transformer(temporal_dim, depth, num_heads, dim_head, temporal_dim*hidden_scale, 0.) # [768, 4, 16, 64, 768*4]
             
-            # 4b. 创建一个跨注意力模块，用于融合局部和全局视频特征
-            cross_attention_num_heads = 3 # MultiHeadCrossAttention
-            self.multi_head_cross_attention = MultiHeadCrossAttention(temporal_dim, cross_attention_num_heads)
-        
-        # 5. == 创建一个线性投影层 ==
-        #    作用：将高维的视频特征 (如 CLIP 的 768 维) 映射到
-        #    主音乐生成 Transformer 的工作维度 (dim, 例如 128)，作为桥梁。
         self.visual_feature_proj = nn.Linear(temporal_dim, dim)                       
 
 
-        if self.audio_encoder == 'mert':
-            # MERT 模型的 Hugging Face ID
-            mert_model_id = "m-a-p/MERT-v1-95M" 
-            
-            # 加载预训练的 MERT 模型
-            self.audio_encoder_model = AutoModel.from_pretrained(mert_model_id,trust_remote_code=True)
-            # 加载 MERT 对应的音频预处理器
-            self.audio_processor = AutoFeatureExtractor.from_pretrained(mert_model_id,trust_remote_code=True)
-        else:
-            print(f'the audio encoder now is:{self.audio_encoder}')
-            print(f'please input the right audio encoder.')
-            exit()
-            
-        if self.audio_encoder == 'mert':
-            # MERT 模型的输出特征维度，从config动态获取
-            audio_feature_dim = self.audio_encoder_model.config.hidden_size # MERT-90M 的 hidden_size 是 768
-            
-            # 将音频编码器设置为评估模式
-            self.audio_encoder_model = self.audio_encoder_model.eval()
-            
-            # 冻结音频编码器的所有参数
-            for param in self.audio_encoder_model.parameters():
-                param.requires_grad = False
-        
-        # 创建音频特征投影层 (逻辑不变)
-        self.audio_feature_proj = nn.Linear(audio_feature_dim, dim)
 
 
-        # 从 kwargs 中安全地获取 dropout 等参数，如果不存在则使用默认值
-        dropout = kwargs.get('dropout', 0.1)
-        activation = kwargs.get('activation', 'relu')
-        
-        self.audio_adapter = StreamingTransformerLayer(
-            d_model=dim, 
-            num_heads=num_heads, 
-            dim_feedforward=int(hidden_scale * dim),
-            dropout=dropout,
-            activation=activation,
-            norm_first=norm_first,
-            norm=norm,
-            causal=True,
-            cross_attention=True # <--- 必须启用交叉注意力
-        )
-        print("--> 已创建可训练的 audio_adapter (StreamingTransformerLayer)。")
 
-        print("--> 开始冻结 VidMuse 预训练模块 (采用白名单策略)...")
-        
-        # 1. 将模型的所有参数默认设置为不可训练
-        for param in self.parameters():
-            param.requires_grad = False
-            
-        # 2. 定义我们想要训练的“新模块”白名单
-        #    在我们的设计中，只有 audio_adapter 和 audio_feature_proj 是需要训练的。
-        trainable_modules = [
-            self.audio_adapter,
-            self.audio_feature_proj
-        ]
-        
-        # 3. 遍历白名单，将这些模块的参数重新设置为可训练
-        for module in trainable_modules:
-            for param in module.parameters():
-                param.requires_grad = True
-                
-        # 4. (可选但推荐) 打印出可训练参数的数量和总参数量的对比，以供验证
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
-        print(f"--> 模型冻结完毕。")
-        print(f"    总参数量: {total_params / 1e6:.2f} M")
-        print(f"    可训练参数量: {trainable_params / 1e3:.2f} K")
-        print(f"    可训练参数比例: {100 * trainable_params / total_params:.4f} %")
 
     def _init_weights(self, weight_init: tp.Optional[str], depthwise_init: tp.Optional[str], zero_bias_init: bool):
         """Initialization of the transformer module weights.
@@ -430,7 +379,17 @@ class LMModel(StreamingModule):
         return self.n_q
 
     # 这个方法是模型内部的视频处理流水线，它将 AudioDataset 传入的原始视频张量转换成最终的条件嵌入。
-    def compute_video_emb(self, video_tensor_list: tp.List, device: str) -> torch.Tensor:
+    def compute_video_emb(self, video_tensor_list: tp.List, device: str) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+        """
+        [修改后]
+        计算独立的、经过时序建模的局部和全局视频特征。
+        不再进行最终的融合与投影。
+
+        Returns:
+            A tuple of two tensors: (local_video_feature, global_video_feature)
+            - local_video_feature (torch.Tensor): 形状 [B, T_local * P, D_clip]
+            - global_video_feature (torch.Tensor): 形状 [B, T_global * P, D_clip]
+        """
         # ... (断言和解包)
         assert isinstance(video_tensor_list, list)
         assert self.if_add_gobal
@@ -479,18 +438,23 @@ class LMModel(StreamingModule):
                 b=global_batch_size, t=global_time_length
             )
 
-        # 4. 融合局部和全局特征
-        video_hidden = self.multi_head_cross_attention(local_video_hidden, global_video_hidden)
-        # 5. 通过投影层将特征维度映射到目标维度
-        video_emb = self.visual_feature_proj(video_hidden)
+        return local_video_hidden, global_video_hidden
 
-        return video_emb
+        # # 4. 融合局部和全局特征
+        # video_hidden = self.multi_head_cross_attention(local_video_hidden, global_video_hidden)
+        # # 5. 通过投影层将特征维度映射到目标维度
+        # video_emb = self.visual_feature_proj(video_hidden)
+        # return video_emb
 
-    def compute_audio_emb(self, reference_audio: torch.Tensor) -> torch.Tensor:
+    def compute_audio_emb(self, reference_audio: torch.Tensor) -> tp.Tuple[torch.Tensor, torch.Tensor]:
         """
-        计算参考音频的风格嵌入。
-        设计约定：此方法期望输入的 `reference_audio` 的采样率
-        已经与 self.audio_processor.sampling_rate (MERT的24kHz) 完全匹配。
+        [修改后]
+        计算并返回音频的全局风格向量和经过时序建模的风格特征序列。
+
+        Returns:
+            A tuple of two tensors: (global_audio_vector, audio_style_sequence)
+            - global_audio_vector (torch.Tensor): 形状 [B, D_mert], 用于FiLM调制。
+            - audio_style_sequence (torch.Tensor): 形状 [B, T_a, D_mert], 用于交叉注意力。
         """
         device = self.audio_feature_proj.weight.device
         reference_audio = reference_audio.to(device)
@@ -522,12 +486,14 @@ class LMModel(StreamingModule):
         # --- 通过MERT模型提取特征 (不变) ---
         with torch.no_grad():
             audio_outputs = self.audio_encoder_model(processed_wav)
-            last_hidden_state = audio_outputs.last_hidden_state
-            audio_features = last_hidden_state.mean(dim=1)
-        
-        # --- 线性投影和增加维度 (不变) ---
-        audio_emb = self.audio_feature_proj(audio_features)
-        return audio_emb.unsqueeze(1)
+            audio_feat_sequence = audio_outputs.last_hidden_state # -> 形状 [B, T_a, D_mert]
+
+        global_audio_vector = audio_feat_sequence.mean(dim=1) # -> 形状 [B, D_mert]
+
+        audio_style_sequence = self.audio_style_processor(audio_feat_sequence) # -> 形状 [B, T_a, D_mert]
+
+        return global_audio_vector, audio_style_sequence
+
 
 
     def forward(self, sequence: torch.Tensor,
@@ -538,10 +504,8 @@ class LMModel(StreamingModule):
                 precomputed_audio_emb: tp.Optional[torch.Tensor] = None
                 ) -> torch.Tensor:
         """
-        模型的核心前向传播。
-        采用串行注入方式：
-        1. 注入音频风格 (通过可训练的 audio_adapter)。
-        2. 注入视频上下文 (通过冻结的主 transformer)。
+        [全新实现]
+        模型的核心前向传播，实现了包含FiLM调制和混合专家交叉注意力的融合策略。
         """
         # ... (处理音频码元序列 'sequence' 得到 'input_')
         B, K, S = sequence.shape
@@ -552,35 +516,49 @@ class LMModel(StreamingModule):
 
         # a. 如果没有预计算的视频嵌入，就实时计算
         if precomputed_video_emb is None:
-            video_emb = self.compute_video_emb(video_tensor_list, device=self.device)
+            assert video_tensor_list is not None
+            raw_local_vid, raw_global_vid = self.compute_video_emb(video_tensor_list, self.device)
+            # video_emb = self.compute_video_emb(video_tensor_list, device=self.device)
         else:
             # 在生成模式下，使用预先计算好的嵌入
-            video_emb = precomputed_video_emb
+            raw_local_vid, raw_global_vid = precomputed_video_emb
+            # video_emb = precomputed_video_emb
+
+        # 对视频特征进行最终的投影
+        local_vid_ctx = self.visual_feature_proj(raw_local_vid)
+        global_vid_ctx = self.visual_feature_proj(raw_global_vid)
 
         # b. 计算音频嵌入 (调用我们新写的方法)
         if precomputed_audio_emb is None:
-            audio_emb = self.compute_audio_emb(reference_audio)
+            # audio_emb = self.compute_audio_emb(reference_audio)
+            assert reference_audio is not None
+            global_audio_vec_raw, raw_audio_seq = self.compute_audio_emb(reference_audio)
         else:
-            audio_emb = precomputed_audio_emb
+            # audio_emb = precomputed_audio_emb
+            global_audio_vec_raw, raw_audio_seq = precomputed_audio_emb
 
-        # --- 3. 串行注入 (Serial Injection) ---
-        # a. 第一阶段：注入音频风格
-        #    将音乐序列 `input_` 送入我们新的、可训练的 `audio_adapter`。
-        #    `audio_adapter` 内部会执行自注意力，以及对 `audio_emb` 的交叉注意力。
-        #    `audio_adapter` 的参数 requires_grad=True，所以梯度会在这里计算。
-        music_with_style = self.audio_adapter(
-            src=input_,
-            cross_attention_src=audio_emb
-        )
-        # b. 第二阶段：注入视频上下文
-        #    将已经融合了风格的 `music_with_style` 送入原有的、冻结的主 `transformer`。
-        #    `transformer` 的参数 requires_grad=False，所以这里是一个纯粹的前向传播，不会产生梯度。
-        #    我们使用 with torch.no_grad() 来确保这一点，并可能节省一些内存。
-        
+        # 对音频序列特征进行最终的投影
+        audio_style_seq_ctx = self.audio_feature_proj(raw_audio_seq)
+        # 用于FiLM的全局向量，在送入style_projector前不需要投影
+        global_audio_vec = global_audio_vec_raw
+
         out = self.transformer(
-            music_with_style,
-            cross_attention_src=video_emb
+            x=input_,
+            local_vid_ctx=local_vid_ctx,
+            global_vid_ctx=global_vid_ctx,
+            audio_style_seq_ctx=audio_style_seq_ctx,
+            audio_style_global_vec=global_audio_vec,
         )
+        # --- 4. 输出处理 (逻辑不变) ---
+        if self.out_norm:
+            out = self.out_norm(out)
+        logits = torch.stack([self.linears[k](out) for k in range(K)], dim=1)
+        # 对齐 logits 长度 (如果需要)
+        # 这里的 fuser 检查可能需要调整，因为我们现在没有主动使用它来处理交叉注意力
+        # 为了安全，我们暂时注释掉或简化它
+        # if 'fuser' in self.__dict__ and len(self.fuser.fuse2cond['prepend']) > 0:
+        #     logits = logits[:, :, -S:]
+        return logits
         # --- 4. 输出处理 (逻辑不变) ---
         if self.out_norm:
             out = self.out_norm(out)
@@ -593,23 +571,6 @@ class LMModel(StreamingModule):
         return logits
 
 
-        # # 3. --- 特征融合：拼接 (Feature Fusion: Concatenation) ---
-        # # video_emb shape: [B, T_video, D]
-        # # audio_emb shape: [B, 1, D]
-        # # fused_emb shape: [B, 1 + T_video, D]
-        # fused_emb = torch.cat([audio_emb, video_emb], dim=1)
-
-        # # 4. --- 注入Transformer (核心步骤) ---
-        # # 将融合后的 `fused_emb` 作为唯一的交叉注意力源
-        # out = self.transformer(input_, cross_attention_src=fused_emb)
-        # if self.out_norm:
-        #     out = self.out_norm(out)
-        # logits = torch.stack([self.linears[k](out) for k in range(K)], dim=1)
-
-        # # 如果有 'prepend' 的条件，需要对齐 logits 长度
-        # if 'fuser' in self.__dict__ and len(self.fuser.fuse2cond['prepend']) > 0:
-        #     logits = logits[:, :, -S:]
-        # return logits  # [B, K, S, card]
 
 
     def compute_predictions(
@@ -670,8 +631,8 @@ class LMModel(StreamingModule):
             top_p: float = 0.0,
             cfg_coef: tp.Optional[float] = None,
             two_step_cfg: tp.Optional[bool] = None,
-            precomputed_video_emb: tp.Optional[torch.Tensor] = None,  # 新增参数
-            precomputed_audio_emb: tp.Optional[torch.Tensor] = None
+            precomputed_video_emb: tp.Optional[tp.Tuple[torch.Tensor, torch.Tensor]] = None,
+            precomputed_audio_emb: tp.Optional[tp.Tuple[torch.Tensor, torch.Tensor]] = None
         ) -> torch.Tensor:
         """Sample next token from the model given a sequence and a set of conditions. The model supports
         multiple sampling strategies (greedy sampling, softmax, top-k, top-p...).
@@ -700,38 +661,45 @@ class LMModel(StreamingModule):
         local_cfg_conditions = cfg_conditions_list[0]
         global_cfg_conditions = cfg_conditions_list[1]
 
-        if two_step_cfg and local_cfg_conditions != {}:
-            assert isinstance(local_cfg_conditions, tuple), type(local_cfg_conditions)
-            local_condition_tensors, local_null_condition_tensors = local_cfg_conditions
-            global_condition_tensors, global_null_condition_tensors = global_cfg_conditions
-            cond_logits = model(sequence, conditions=[], condition_tensors=[local_condition_tensors, global_condition_tensors])
+        if two_step_cfg:
+            raise NotImplementedError(
+                "Two-step CFG is not yet implemented for the new multimodal architecture. "
+                "Please set two_step_cfg=False in your configuration."
+            )
+            # assert isinstance(local_cfg_conditions, tuple), type(local_cfg_conditions)
+            # local_condition_tensors, local_null_condition_tensors = local_cfg_conditions
+            # global_condition_tensors, global_null_condition_tensors = global_cfg_conditions
+            # cond_logits = model(sequence, conditions=[], condition_tensors=[local_condition_tensors, global_condition_tensors])
 
-            state = self.get_streaming_state()
-            self.set_streaming_state(unconditional_state)
-            uncond_logits = model(sequence, conditions=[], condition_tensors=[local_null_condition_tensors, global_null_condition_tensors])
-            unconditional_state.update(self.get_streaming_state())
-            self.set_streaming_state(state)
-            logits = uncond_logits + (cond_logits - uncond_logits) * self.cfg_coef
+            # state = self.get_streaming_state()
+            # self.set_streaming_state(unconditional_state)
+            # uncond_logits = model(sequence, conditions=[], condition_tensors=[local_null_condition_tensors, global_null_condition_tensors])
+            # unconditional_state.update(self.get_streaming_state())
+            # self.set_streaming_state(state)
+            # logits = uncond_logits + (cond_logits - uncond_logits) * self.cfg_coef
         else:
-            local_condition_tensors = cfg_conditions_list[0].to(sequence.device)
-            global_condition_tensors = cfg_conditions_list[1].to(sequence.device)
+            # local_condition_tensors = cfg_conditions_list[0].to(sequence.device)
+            # global_condition_tensors = cfg_conditions_list[1].to(sequence.device)
             sequence = torch.cat([sequence, sequence], dim=0)
-            
-            # 生成时使用预计算的视频特征，避免重复提取
-            if precomputed_video_emb is None:
-                video_emb = self.compute_video_emb([cfg_conditions_list[0], cfg_conditions_list[1]], device=sequence.device)
-            else:
-                video_emb = precomputed_video_emb
+            assert precomputed_video_emb is not None, "Precomputed video embeddings must be provided."
+            assert precomputed_audio_emb is not None, "Precomputed audio embeddings must be provided."
 
-            assert precomputed_audio_emb is not None
+            # # 生成时使用预计算的视频特征，避免重复提取
+            # if precomputed_video_emb is None:
+            #     video_emb = self.compute_video_emb([cfg_conditions_list[0], cfg_conditions_list[1]], device=sequence.device)
+            # else:
+            #     video_emb = precomputed_video_emb
 
             # 视频特征参与下一步音乐编码的预测
             all_logits = model(
                 sequence,
                 conditions=[], 
-                video_tensor_list=[],  
-                precomputed_video_emb=video_emb,
-                precomputed_audio_emb=precomputed_audio_emb 
+                video_tensor_list=[], 
+                reference_audio=None, 
+                precomputed_video_emb=precomputed_video_emb, # <--- 使用预计算的视频嵌入
+                precomputed_audio_emb=precomputed_audio_emb  # <--- 使用预计算的音频嵌入
+                # precomputed_video_emb=video_emb,
+                # precomputed_audio_emb=precomputed_audio_emb 
             )
             cond_logits, uncond_logits = all_logits.split(B, dim=0)  # [B, K, T, card]
             logits = uncond_logits + (cond_logits - uncond_logits) * cfg_coef
@@ -841,14 +809,16 @@ class LMModel(StreamingModule):
         assert start_offset_sequence is not None
 
         # 1. == 优化：在生成循环开始前，只计算一次视频嵌入 ==
-        video_emb = self.compute_video_emb([local_cfg_conditions, global_cfg_conditions], device=device)
+        # video_emb = self.compute_video_emb([local_cfg_conditions, global_cfg_conditions], device=device)
+        video_emb_tuple = self.compute_video_emb([local_cfg_conditions, global_cfg_conditions], device=device)
 
         # ========== 添加：音频的 CFG 准备和嵌入预计算 ==========
         null_reference_audio = torch.zeros_like(reference_audio)
         # b. 将有条件和无条件版本在 batch 维度上拼接
         reference_audio_cfg = torch.cat([reference_audio, null_reference_audio], dim=0)
         # c. 一次性计算 2*B 大小的音频嵌入
-        audio_emb_cfg = self.compute_audio_emb(reference_audio_cfg)
+        # audio_emb_cfg = self.compute_audio_emb(reference_audio_cfg)
+        audio_emb_tuple = self.compute_audio_emb(reference_audio_cfg)
 
 
         with self.streaming():
@@ -873,8 +843,8 @@ class LMModel(StreamingModule):
                     top_p,
                     cfg_coef=cfg_coef, 
                     two_step_cfg=two_step_cfg,
-                    precomputed_video_emb=video_emb,
-                    precomputed_audio_emb=audio_emb_cfg # <-- 新增
+                    precomputed_video_emb=video_emb_tuple, # <-- 传递视频嵌入元组
+                    precomputed_audio_emb=audio_emb_tuple  # <-- 传递音频嵌入元组
                 )
                 valid_mask = mask[..., offset:offset+1].expand(B, -1, -1)
                 next_token[~valid_mask] = self.special_token_id

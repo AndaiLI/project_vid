@@ -564,6 +564,92 @@ class StreamingTransformerLayer(nn.TransformerEncoderLayer):
         return x
 
 
+class MultimodalInjectionLayer(StreamingTransformerLayer):
+    """
+    一个全新的、多模态注入Transformer层。
+    它继承自 StreamingTransformerLayer 以复用其流式处理能力、自注意力、前馈网络等。
+    但它的 forward 方法被重写，以实现先进的多模态融合策略。
+    """
+    def __init__(self, d_model: int, num_heads: int, dim_feedforward: int, **kwargs):
+        # 1. 初始化父类。causal=True 是必需的，cross_attention=False 因为我们将自己处理
+
+        mert_dim = kwargs.pop('mert_dim', None) # 使用 .pop()
+        assert mert_dim is not None, "mert_dim must be provided to MultimodalInjectionLayer"
+
+        kwargs.pop('causal', None)
+        kwargs.pop('cross_attention', None)
+
+        super().__init__(d_model, num_heads, dim_feedforward, causal=True, cross_attention=True, **kwargs)
+
+        # mert_dim = kwargs.get('mert_dim')
+        # assert mert_dim is not None, "mert_dim must be provided to MultimodalInjectionLayer"
+        # 2. 为FiLM全局风格调制创建投影层
+
+        self.style_projector = nn.Linear(mert_dim, d_model * 2) # <--- 使用 mert_dim
+        self.norm_style = create_norm_fn(kwargs.get('norm', 'layer_norm'), d_model)
+
+        # 3. 创建三个独立的“专家”交叉注意力模块
+        attn_kwargs = {
+            'embed_dim': d_model, 'num_heads': num_heads, 
+            'dropout': kwargs.get('dropout', 0.1), 'cross_attention': True
+        }
+        # self.cross_attn_local_vid = StreamingMultiheadAttention(**attn_kwargs)
+        self.cross_attn_global_vid = StreamingMultiheadAttention(**attn_kwargs)
+        self.cross_attn_audio_style = StreamingMultiheadAttention(**attn_kwargs)
+        
+        # 4. 创建门控网络
+        self.gating_network = nn.Linear(d_model, 3)
+
+        # 5. 创建额外的 LayerNorm
+        self.norm_fused_context = create_norm_fn(kwargs.get('norm', 'layer_norm'), d_model)
+
+    def forward(self, src: torch.Tensor, 
+                # --- 新增的、用于多模态融合的上下文参数 ---
+                local_vid_ctx: tp.Optional[torch.Tensor] = None, 
+                global_vid_ctx: tp.Optional[torch.Tensor] = None, 
+                audio_style_seq_ctx: tp.Optional[torch.Tensor] = None,
+                audio_style_global_vec: tp.Optional[torch.Tensor] = None,
+                # --- 父类原有的参数 ---
+                src_mask: tp.Optional[torch.Tensor] = None,
+                src_key_padding_mask: tp.Optional[torch.Tensor] = None):
+        
+        x = src
+        
+        # --- 步骤 0: 全局风格注入 (FiLM调制) ---
+        if audio_style_global_vec is not None:
+            style_params = self.style_projector(audio_style_global_vec)
+            scale, shift = style_params.chunk(2, dim=-1)
+            x = self.norm_style(x * scale.unsqueeze(1) + shift.unsqueeze(1))
+        
+        # --- 步骤 1: 自注意力 (复用父类的方法和 pre-norm/post-norm 逻辑) ---
+        if self.norm_first:
+            x = x + self.layer_scale_1(self._sa_block(self.norm1(x), src_mask, src_key_padding_mask))
+        else:
+            x = self.norm1(x + self.layer_scale_1(self._sa_block(x, src_mask, src_key_padding_mask)))
+
+        # --- 步骤 2 & 3: 混合专家交叉注意力 ---
+        # (我们假设所有 context 都已被提供)
+        # local_ctx_out = self.cross_attn_local_vid(x, local_vid_ctx, local_vid_ctx)[0]
+        local_ctx_out = self.cross_attention(src, local_vid_ctx, local_vid_ctx)[0] # <-- 使用 self.cross_attention
+        global_ctx_out = self.cross_attn_global_vid(x, global_vid_ctx, global_vid_ctx)[0]
+        style_ctx_out = self.cross_attn_audio_style(x, audio_style_seq_ctx, audio_style_seq_ctx)[0]
+        
+        all_contexts = torch.stack([local_ctx_out, global_ctx_out, style_ctx_out], dim=2)
+        gate_logits = self.gating_network(x)
+        gates = torch.softmax(gate_logits, dim=-1).unsqueeze(-1)
+        fused_context = (all_contexts * gates).sum(dim=2)
+        
+        # 应用残差连接
+        x = self.norm_fused_context(x + fused_context)
+
+        # --- 步骤 4: 前馈网络 (复用父类的方法和 pre-norm/post-norm 逻辑) ---
+        if self.norm_first:
+            x = x + self.layer_scale_2(self._ff_block(self.norm2(x)))
+        else:
+            x = self.norm2(x + self.layer_scale_2(self._ff_block(x)))
+
+        return x
+
 class StreamingTransformer(StreamingModule):
     """Transformer with Streaming / Causal support.
 
@@ -680,7 +766,12 @@ class StreamingTransformer(StreamingModule):
         else:
             raise ValueError(f"Checkpointing method {method} is unknown.")
 
-    def forward(self, x: torch.Tensor, *args, **kwargs):
+    def forward(self, x: torch.Tensor, 
+                local_vid_ctx: tp.Optional[torch.Tensor] = None, 
+                global_vid_ctx: tp.Optional[torch.Tensor] = None, 
+                audio_style_seq_ctx: tp.Optional[torch.Tensor] = None,
+                audio_style_global_vec: tp.Optional[torch.Tensor] = None,
+                *args, **kwargs):
         B, T, C = x.shape
 
         if 'offsets' in self._streaming_state:
@@ -695,7 +786,12 @@ class StreamingTransformer(StreamingModule):
             x = x + self.positional_scale * pos_emb
 
         for layer in self.layers:
-            x = self._apply_layer(layer, x, *args, **kwargs)
+            x = self._apply_layer(layer, x, 
+                local_vid_ctx=local_vid_ctx,
+                global_vid_ctx=global_vid_ctx,
+                audio_style_seq_ctx=audio_style_seq_ctx,
+                audio_style_global_vec=audio_style_global_vec,
+                *args, **kwargs)
 
         if self._is_streaming:
             self._streaming_state['offsets'] = offsets + T

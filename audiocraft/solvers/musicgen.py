@@ -337,7 +337,6 @@ class MusicGenSolver(base.StandardSolver):
 
         assert len(video_list)==2
         # 4. == 返回处理好的数据 ==
-        #    注意：返回的第一个元素就是包含两个视频张量的列表。
         return style_audio, [local_video, global_video], audio_tokens, padding_mask
 
     # 这个方法定义了单次训练迭代（一次前向传播 + 一次反向传播）的具体流程。
@@ -396,10 +395,11 @@ class MusicGenSolver(base.StandardSolver):
                     
                     resampled_generated = self.resampler_to_style(generated_audio)
 
-                style_emb_pred = self.model.compute_audio_emb(resampled_generated)
-                style_emb_target = self.model.compute_audio_emb(style_audio)
+                style_emb_pred = self.model.compute_audio_emb(resampled_generated)[1]
+                style_emb_target = self.model.compute_audio_emb(style_audio)[1]
                 
-                style_loss = 1 - F.cosine_similarity(style_emb_pred.squeeze(1), style_emb_target.squeeze(1)).mean()
+                # style_loss = 1 - F.cosine_similarity(style_emb_pred.squeeze(1), style_emb_target.squeeze(1)).mean()
+                style_loss = 1 - F.cosine_similarity(style_emb_pred.mean(dim=1), style_emb_target.mean(dim=1)).mean()
             
             # 3c. 组合损失
             loss = ce + lambda_style * style_loss
