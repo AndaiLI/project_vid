@@ -589,13 +589,17 @@ class MultimodalInjectionLayer(StreamingTransformerLayer):
         self.norm_style = create_norm_fn(kwargs.get('norm', 'layer_norm'), d_model)
 
         # 3. 创建三个独立的“专家”交叉注意力模块
-        attn_kwargs = {
-            'embed_dim': d_model, 'num_heads': num_heads, 
-            'dropout': kwargs.get('dropout', 0.1), 'cross_attention': True
+        base_attn_kwargs = {
+            'embed_dim': self.cross_attention.embed_dim, 
+            'num_heads': self.cross_attention.num_heads, 
+            'dropout': self.cross_attention.dropout, 
+            'cross_attention': True,
+            'qk_layer_norm': self.cross_attention.qk_layer_norm # <--- 从父类实例中直接读取！
         }
+
         # self.cross_attn_local_vid = StreamingMultiheadAttention(**attn_kwargs)
-        self.cross_attn_global_vid = StreamingMultiheadAttention(**attn_kwargs)
-        self.cross_attn_audio_style = StreamingMultiheadAttention(**attn_kwargs)
+        self.cross_attn_global_vid = StreamingMultiheadAttention(**base_attn_kwargs)
+        self.cross_attn_audio_style = StreamingMultiheadAttention(**base_attn_kwargs)
         
         # 4. 创建门控网络
         self.gating_network = nn.Linear(d_model, 3)
@@ -615,12 +619,6 @@ class MultimodalInjectionLayer(StreamingTransformerLayer):
         
         x = src
         
-        # --- 步骤 0: 全局风格注入 (FiLM调制) ---
-        if audio_style_global_vec is not None:
-            style_params = self.style_projector(audio_style_global_vec)
-            scale, shift = style_params.chunk(2, dim=-1)
-            x = self.norm_style(x * scale.unsqueeze(1) + shift.unsqueeze(1))
-        
         # --- 步骤 1: 自注意力 (复用父类的方法和 pre-norm/post-norm 逻辑) ---
         if self.norm_first:
             x = x + self.layer_scale_1(self._sa_block(self.norm1(x), src_mask, src_key_padding_mask))
@@ -632,7 +630,7 @@ class MultimodalInjectionLayer(StreamingTransformerLayer):
         # local_ctx_out = self.cross_attn_local_vid(x, local_vid_ctx, local_vid_ctx)[0]
         local_ctx_out = self.cross_attention(src, local_vid_ctx, local_vid_ctx)[0] # <-- 使用 self.cross_attention
         global_ctx_out = self.cross_attn_global_vid(x, global_vid_ctx, global_vid_ctx)[0]
-        style_ctx_out = self.cross_attn_audio_style(x, audio_style_seq_ctx, audio_style_seq_ctx)[0]
+        style_ctx_out = self.cross_attn_global_vid(x, audio_style_global_vec, audio_style_global_vec)[0]
         
         all_contexts = torch.stack([local_ctx_out, global_ctx_out, style_ctx_out], dim=2)
         gate_logits = self.gating_network(x)

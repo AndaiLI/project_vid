@@ -28,6 +28,7 @@ except ImportError:
 from .base import StandardSolver
 from .. import adversarial, data, losses, metrics, optim
 from ..utils.utils import dict_from_config, get_loader
+from audiocraft.data.preloaded_dataset import PreloadedAudioDataset
 
 
 logger = logging.getLogger(__name__)
@@ -379,24 +380,46 @@ def get_audio_datasets(cfg: omegaconf.DictConfig,
         batch_size = kwargs.pop('batch_size', None)
         num_workers = kwargs.pop('num_workers')
 
+        # a. 定义是否启用预加载
+        #    我们只对训练集进行预加载，因为它是性能瓶颈
+        #    也可以通过配置文件来控制
+        enable_preload = kwargs.pop('preload_train', False) and (split == 'train')
+
         # 6. == 根据 dataset_type 实例化具体的数据集类 ==
         #    注意，无论实例化哪个子类 (MusicDataset, SoundDataset, etc.),
         #    包含所有视频参数的 kwargs 字典都会被传递给它的构造函数。
         if dataset_type == DatasetType.MUSIC:
-            dataset = data.music_dataset.MusicDataset.from_meta(path, **kwargs)
+            base_dataset = data.music_dataset.MusicDataset.from_meta(path, **kwargs)
         elif dataset_type == DatasetType.SOUND:
-            dataset = data.sound_dataset.SoundDataset.from_meta(path, **kwargs)
+            base_dataset = data.sound_dataset.SoundDataset.from_meta(path, **kwargs)
         elif dataset_type == DatasetType.AUDIO:
-            dataset = data.info_audio_dataset.InfoAudioDataset.from_meta(path, return_info=return_info, **kwargs)
+            base_dataset = data.info_audio_dataset.InfoAudioDataset.from_meta(path, return_info=return_info, **kwargs)
         else:
             raise ValueError(f"Dataset type is unsupported: {dataset_type}")
+
+        # c. ========== 核心修改：包装数据集 ==========
+        if enable_preload:
+            logger.info(f"为 '{split}' 数据集启用预加载 (使用 {num_workers} 个worker)...")
+            # 1. 预加载时，使用配置文件中指定的 num_workers
+            dataset = PreloadedAudioDataset(
+                underlying_dataset=base_dataset,
+                num_workers=num_workers
+            )
+            # 2. 预加载完成后，主 DataLoader 不再需要并行 worker
+            main_loader_num_workers = 0 
+            logger.info(f"预加载完毕. 主训练 DataLoader 将使用 {main_loader_num_workers} 个 worker。")
+        else:
+            # 如果不启用预加载，就使用原始的数据集
+            dataset = base_dataset
+            main_loader_num_workers = num_workers
+        # ===============================================
 
         # 7. 创建并存储 DataLoader
         loader = get_loader(
             dataset,
             num_samples,
             batch_size=batch_size,
-            num_workers=num_workers,
+            num_workers=main_loader_num_workers,
             seed=seed,
             collate_fn=dataset.collater if return_info else None,
             shuffle=shuffle,

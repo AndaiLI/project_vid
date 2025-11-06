@@ -496,7 +496,13 @@ class AudioDataset:
                     # 1. 读取音频片段
                     out, sr = audio_read(file_meta.path, seek_time, self.segment_duration, pad=False)
 
-                    style_audio = convert_audio(out, sr, self.audio_encoder_sr, self.channels)
+                    min_style_duration = 3.0
+                    style_duration = random.uniform(min_style_duration, self.segment_duration)
+                    max_seek_style = max(0, file_meta.duration - style_duration)
+                    seek_time_style = random.uniform(0, max_seek_style)
+                    style_raw, _ = audio_read(file_meta.path, seek_time_style, style_duration, pad=False)
+
+                    style_audio = convert_audio(style_raw, sr, self.audio_encoder_sr, self.channels)
 
                     out = convert_audio(out, sr, self.sample_rate, self.channels)
                     n_frames = out.shape[-1]

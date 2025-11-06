@@ -538,16 +538,18 @@ class LMModel(StreamingModule):
             global_audio_vec_raw, raw_audio_seq = precomputed_audio_emb
 
         # 对音频序列特征进行最终的投影
-        audio_style_seq_ctx = self.audio_feature_proj(raw_audio_seq)
+        projected_global_audio_vec = self.audio_feature_proj(global_audio_vec_raw)
+        #audio_style_seq_ctx = self.audio_feature_proj(raw_audio_seq)
         # 用于FiLM的全局向量，在送入style_projector前不需要投影
-        global_audio_vec = global_audio_vec_raw
+        audio_style_global_ctx = projected_global_audio_vec.unsqueeze(1)
+        # global_audio_vec = global_audio_vec_raw
 
         out = self.transformer(
             x=input_,
             local_vid_ctx=local_vid_ctx,
             global_vid_ctx=global_vid_ctx,
-            audio_style_seq_ctx=audio_style_seq_ctx,
-            audio_style_global_vec=global_audio_vec,
+            #audio_style_seq_ctx=audio_style_seq_ctx,
+            audio_style_global_vec=audio_style_global_ctx,
         )
         # --- 4. 输出处理 (逻辑不变) ---
         if self.out_norm:

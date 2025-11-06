@@ -2,8 +2,8 @@ import os
 import json
 import librosa
 
-wav_dir = './dataset/example/train/audio'
-mp4_dir = './dataset/example/train/video'
+wav_dir = '/data/lw/filtered_audios'
+mp4_dir = '/data/lw/filtered_videos'
 
 output_file = './egs/V2M/example/data.jsonl'
 if not os.path.exists(os.path.dirname(output_file)):

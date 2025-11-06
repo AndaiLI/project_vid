@@ -357,6 +357,22 @@ class MusicGenSolver(base.StandardSolver):
 
         self.deadlock_detect.update('tokens_and_conditions')
 
+
+        # ========== 核心添加：风格随机失活 (Style Dropout) ==========
+        # 从配置中获取失活概率，如果没有则默认为0 (不启用)
+        style_dropout_p = self.cfg.optim.get('style_dropout_p', 0.0)
+        
+        reference_audio_for_model = style_audio
+        apply_style_loss = True # 默认总是计算风格损失
+        
+        if self.is_training and torch.rand(1).item() < style_dropout_p:
+            # 在训练时，以 p 的概率触发
+            # a. 将参考音频替换为静音
+            reference_audio_for_model = torch.zeros_like(style_audio)
+            # b. 在这种情况下，计算风格损失没有意义，将其禁用
+            apply_style_loss = False
+        # =============================================================    
+
         if check_synchronization_points:
             torch.cuda.set_sync_debug_mode('warn')
 
@@ -370,7 +386,7 @@ class MusicGenSolver(base.StandardSolver):
                 codes=audio_tokens,
                 conditions=[], # 我们决定不使用文本 attributes
                 condition_tensors_list=[local_video, global_video], # 直接使用 _prepare... 返回的 video_list
-                reference_audio=style_audio  # 明确地将 style_audio 传给 reference_audio 参数
+                reference_audio=reference_audio_for_model   # 明确地将 style_audio 传给 reference_audio 参数
             )
             logits = model_output.logits
             mask = padding_mask & model_output.mask
@@ -381,7 +397,7 @@ class MusicGenSolver(base.StandardSolver):
             style_loss = torch.tensor(0.0, device=ce.device, dtype=ce.dtype)
             lambda_style = self.cfg.optim.get('lambda_style', 0.0)
 
-            if self.is_training and lambda_style > 0:
+            if self.is_training and lambda_style > 0 and apply_style_loss:
                 with torch.no_grad():
                     generated_tokens = torch.argmax(logits.detach(), dim=-1)
                     generated_audio = self.compression_model.decode(generated_tokens)
