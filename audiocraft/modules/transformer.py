@@ -1,831 +1,809 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
+# Modified from Audiocraft (https://github.com/facebookresearch/audiocraft)
 
-"""
-Transformer model, with streaming support, xformer attention support
-and easy causal attention with a potentially finite receptive field.
-
-See `StreamingTransformer` for more information.
-
-Unlike regular PyTorch Transformer, we make the hard choice that batches are first.
-"""
-
+from pathlib import Path
+import time
 import typing as tp
+import warnings
 
-from einops import rearrange
+import flashy
+import math
+import omegaconf
 import torch
-import torch.nn as nn
+import torchaudio
 from torch.nn import functional as F
-from torch.utils.checkpoint import checkpoint as torch_checkpoint
-from xformers import ops
 
-from .rope import RotaryEmbedding
-from .streaming import StreamingModule
+from . import base, builders
+from .compression import CompressionSolver
+from .. import metrics as eval_metrics
+from .. import models
+from ..data.audio_dataset import AudioDataset
+from ..data.music_dataset import MusicDataset, MusicInfo, AudioInfo
+from ..data.audio_utils import normalize_audio
+from ..modules.conditioners import JointEmbedCondition, SegmentWithAttributes, WavCondition
+from ..utils.cache import CachedBatchWriter, CachedBatchLoader
+from ..utils.samples.manager import SampleManager
+from ..utils.utils import get_dataset_from_loader, is_jsonable, warn_once
 
-_efficient_attention_backend: str = 'torch'
+class MusicGenSolver(base.StandardSolver):
+    """Solver for MusicGen training task.
 
-
-def set_efficient_attention_backend(backend: str = 'torch'):
-    # Using torch by default, it seems a bit faster on older P100 GPUs (~20% faster).
-    global _efficient_attention_backend
-    assert _efficient_attention_backend in ['xformers', 'torch']
-    _efficient_attention_backend = backend
-
-
-def _get_attention_time_dimension(memory_efficient: bool) -> int:
-    if _efficient_attention_backend == 'torch' and memory_efficient:
-        return 2
-    else:
-        return 1
-
-
-def _is_profiled() -> bool:
-    # Return true if we are currently running with a xformers profiler activated.
-    try:
-        from xformers.profiler import profiler
-    except ImportError:
-        return False
-    return profiler._Profiler._CURRENT_PROFILER is not None
-
-
-def create_norm_fn(norm_type: str, dim: int, **kwargs) -> nn.Module:
-    """Create normalization module for transformer encoder layer.
-
-    Args:
-        norm_type (str): Normalization method.
-        dim (int): Dimension of the normalized layer.
-        **kwargs (dict): Additional parameters for normalization layer.
-    Returns:
-        nn.Module: Normalization module.
+    Used in: https://arxiv.org/abs/2306.05284
     """
-    if norm_type == 'layer_norm':
-        return nn.LayerNorm(dim, eps=1e-5, **kwargs)
-    else:
-        raise ValueError(f"Unknown norm type: {norm_type}")
+    DATASET_TYPE: builders.DatasetType = builders.DatasetType.MUSIC
 
-
-def create_sin_embedding(positions: torch.Tensor, dim: int, max_period: float = 10000,
-                         dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """Create sinusoidal positional embedding, with shape `[B, T, C]`.
-
-    Args:
-        positions (torch.Tensor): LongTensor of positions.
-        dim (int): Dimension of the embedding.
-        max_period (float): Maximum period of the cosine/sine functions.
-        dtype (torch.dtype or str): dtype to use to generate the embedding.
-    Returns:
-        torch.Tensor: Sinusoidal positional embedding.
-    """
-    # We aim for BTC format
-    assert dim % 2 == 0
-    half_dim = dim // 2
-    positions = positions.to(dtype)
-    adim = torch.arange(half_dim, device=positions.device, dtype=dtype).view(1, 1, -1)
-    max_period_tensor = torch.full([], max_period, device=positions.device, dtype=dtype)  # avoid sync point
-    phase = positions / (max_period_tensor ** (adim / (half_dim - 1)))
-    return torch.cat([torch.cos(phase), torch.sin(phase)], dim=-1)
-
-
-def expand_repeated_kv(x: torch.Tensor, n_rep: int, memory_efficient: bool) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep) from xlformers."""
-    if n_rep == 1:
-        return x
-    if _efficient_attention_backend == 'torch' and memory_efficient:
-        bs, n_kv_heads, slen, head_dim = x.shape
-        return (
-            x[:, :, None, :, :]
-            .expand(bs, n_kv_heads, n_rep, slen, head_dim)
-            .reshape(bs, n_kv_heads * n_rep, slen, head_dim)
-        )
-    else:
-        bs, slen, n_kv_heads, head_dim = x.shape
-        return (
-            x[:, :, :, None, :]
-            .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-            .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-        )
-
-
-class LayerScale(nn.Module):
-    """Layer scale from [Touvron et al 2021] (https://arxiv.org/pdf/2103.17239.pdf).
-    This rescales diagonally the residual outputs close to 0, with a learnt scale.
-
-    Args:
-        channels (int): Number of channels.
-        init (float): Initial scale.
-        channel_last (bool): If True, expect `[*, C]` shaped tensors, otherwise, `[*, C, T]`.
-        device (torch.device or str, optional): Device on which to initialize the module.
-        dtype (torch.dtype, optional): dtype to use to initialize the module.
-    """
-    def __init__(self, channels: int, init: float = 1e-4, channel_last: bool = True,
-                 device=None, dtype=None):
-        super().__init__()
-        self.channel_last = channel_last
-        self.scale = nn.Parameter(
-            torch.full((channels,), init,
-                       requires_grad=True, device=device, dtype=dtype))
-
-    def forward(self, x: torch.Tensor):
-        if self.channel_last:
-            return self.scale * x
-        else:
-            return self.scale[:, None] * x
-
-
-class StreamingMultiheadAttention(StreamingModule):
-    """Similar to `nn.MultiheadAttention` but with support for streaming, causal evaluation.
-
-    Args:
-        embed_dim (int): Dimension to project to.
-        num_heads (int): Number of heads.
-        dropout (float): Dropout level.
-        bias (bool): Use bias in projections.
-        causal (bool): Causal mask applied automatically.
-        past_context (int, optional): Receptive field for the causal mask, infinite if None.
-        custom (bool): Use custom MHA implementation, for testing / benchmarking.
-        memory_efficient (bool): Use xformers based memory efficient attention.
-        attention_as_float32 (bool): Perform the attention as float32
-            (especially important with memory_efficient as autocast won't do this automatically).
-        rope (`RotaryEmbedding`, optional): Rope embedding to use.
-        cross_attention: Should be true when used as a cross attention.
-            All keys and values must be available at once, streaming is only for the queries.
-            Cannot be used with `causal` or `rope` (as it wouldn't make sens to
-            interpret the time steps in the keys relative to those in the queries).
-        safe_streaming (bool): Bug fix, will go away with xformers update.
-        qk_layer_norm (bool): Layer normalization applied to queries and keys before dot product.
-        kv_repeat (int): If > 1, will repeat keys and queries multiple times (need to divide num_heads).
-            This will lead to faster decoding time on A100 or other GPUs with tensorcore.
-        device (torch.device, optional): Device on which to initialize.
-        dtype (torch.dtype, optional): dtype to use.
-    """
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0, bias: bool = True,
-                 causal: bool = False, past_context: tp.Optional[int] = None, custom: bool = False,
-                 memory_efficient: bool = False, attention_as_float32: bool = False,
-                 rope: tp.Optional[RotaryEmbedding] = None, cross_attention: bool = False,
-                 safe_streaming: bool = True, qk_layer_norm: bool = False, kv_repeat: int = 1,
-                 device=None, dtype=None):
-        super().__init__()
-        factory_kwargs = {'device': device, 'dtype': dtype}
-        if past_context is not None:
-            assert causal
-
-        self.embed_dim = embed_dim
-        self.causal = causal
-        self.past_context = past_context
-        self.memory_efficient = memory_efficient
-        self.attention_as_float32 = attention_as_float32
-        self.rope = rope
-        self.cross_attention = cross_attention
-        self.safe_streaming = safe_streaming
-        self.num_heads = num_heads
-        self.dropout = dropout
-        self.kv_repeat = kv_repeat
-        if cross_attention:
-            assert not causal, "Causal cannot work with cross attention."
-            assert rope is None, "Rope cannot work with cross attention."
-
-        if memory_efficient:
-            _verify_xformers_memory_efficient_compat()
-
-        self.custom = _is_custom(custom, memory_efficient)
-        if self.custom:
-            out_dim = embed_dim
-            assert num_heads % kv_repeat == 0
-            assert not cross_attention or kv_repeat == 1
-            num_kv = num_heads // kv_repeat
-            kv_dim = (embed_dim // num_heads) * num_kv
-            out_dim += 2 * kv_dim
-            in_proj = nn.Linear(embed_dim, out_dim, bias=bias, **factory_kwargs)
-            # We try to follow the default PyTorch MHA convention, to easily compare results.
-            self.in_proj_weight = in_proj.weight
-            self.in_proj_bias = in_proj.bias
-            if bias:
-                self.in_proj_bias.data.zero_()  # Following Pytorch convention
-            self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
-            if bias:
-                self.out_proj.bias.data.zero_()
-        else:
-            assert not qk_layer_norm
-            assert kv_repeat == 1
-            self.mha = nn.MultiheadAttention(
-                embed_dim, num_heads, dropout=dropout, bias=bias, batch_first=True,
-                **factory_kwargs)
-        self.qk_layer_norm = qk_layer_norm
-        if qk_layer_norm:
-            assert self.custom
-            assert kv_repeat == 1
-            ln_dim = embed_dim
-            self.q_layer_norm = nn.LayerNorm(ln_dim)
-            self.k_layer_norm = nn.LayerNorm(ln_dim)
-
-    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        if not self.custom:
-            # Support compat with regular MHA
-            keys = [n for n, _ in self.mha.named_parameters()]
-            for key in keys:
-                if prefix + key in state_dict:
-                    state_dict[prefix + "mha." + key] = state_dict.pop(prefix + key)
-        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
-
-    def _get_mask(self, current_steps: int, device: torch.device, dtype: torch.dtype):
-        # Return a causal mask, accounting for potentially stored past keys/values
-        # We actually return a bias for the attention score, as this has the same
-        # convention both in the builtin MHA in Pytorch, and Xformers functions.
-        time_dim = _get_attention_time_dimension(self.memory_efficient)
-        if self.memory_efficient:
-            from xformers.ops import LowerTriangularMask
-            if current_steps == 1:
-                # If we only have one step, then we do not need a mask.
-                return None
-            elif 'past_keys' in self._streaming_state:
-                raise RuntimeError("Not supported at the moment")
-            else:
-                # Then we can safely use a lower triangular mask
-                return LowerTriangularMask()
-        if self._streaming_state:
-            past_keys = self._streaming_state['past_keys']
-            past_steps = past_keys.shape[time_dim]
-        else:
-            past_steps = 0
-
-        queries_pos = torch.arange(
-            past_steps, current_steps + past_steps, device=device).view(-1, 1)
-        keys_pos = torch.arange(past_steps + current_steps, device=device).view(1, -1)
-        delta = queries_pos - keys_pos
-        valid = delta >= 0
-        if self.past_context is not None:
-            valid &= (delta <= self.past_context)
-        return torch.where(
-            valid,
-            torch.zeros([], device=device, dtype=dtype),
-            torch.full([], float('-inf'), device=device, dtype=dtype))
-
-    def _complete_kv(self, k, v):
-        time_dim = _get_attention_time_dimension(self.memory_efficient)
-        if self.cross_attention:
-            # With cross attention we assume all keys and values
-            # are already available, and streaming is with respect
-            # to the queries only.
-            return k, v
-        # Complete the key/value pair using the streaming state.
-        if self._streaming_state:
-            pk = self._streaming_state['past_keys']
-            nk = torch.cat([pk, k], dim=time_dim)
-            if v is k:
-                nv = nk
-            else:
-                pv = self._streaming_state['past_values']
-                nv = torch.cat([pv, v], dim=time_dim)
-        else:
-            nk = k
-            nv = v
-
-        assert nk.shape[time_dim] == nv.shape[time_dim]
-        offset = 0
-        if self.past_context is not None:
-            offset = max(0, nk.shape[time_dim] - self.past_context)
-        if self._is_streaming:
-            self._streaming_state['past_keys'] = nk[:, offset:]
-            if v is not k:
-                self._streaming_state['past_values'] = nv[:, offset:]
-            if 'offset' in self._streaming_state:
-                self._streaming_state['offset'] += offset
-            else:
-                self._streaming_state['offset'] = torch.tensor(0)
-        return nk, nv
-
-    def _apply_rope(self, query: torch.Tensor, key: torch.Tensor):
-        time_dim = _get_attention_time_dimension(self.memory_efficient)
-        # Apply rope embeddings to query and key tensors.
-        assert self.rope is not None
-        if 'past_keys' in self._streaming_state:
-            past_keys_offset = self._streaming_state['past_keys'].shape[1]
-        else:
-            past_keys_offset = 0
-        if 'offset' in self._streaming_state:
-            past_context_offset = int(self._streaming_state['offset'].item())
-        else:
-            past_context_offset = 0
-        streaming_offset = past_context_offset + past_keys_offset
-        return self.rope.rotate_qk(query, key, start=streaming_offset, time_dim=time_dim)
-
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-                key_padding_mask=None, need_weights=False, attn_mask=None,
-                average_attn_weights=True, is_causal=False):
-        assert attn_mask is None
-        assert not is_causal, ("New param added in torch 2.0.1 not supported, "
-                               "use the causal args in the constructor.")
-
-        time_dim = _get_attention_time_dimension(self.memory_efficient)
-        if time_dim == 2:
-            layout = "b h t d"
-        else:
-            layout = "b t h d"
-        dtype = query.dtype
-        if self._is_streaming:
-            assert self.causal or self.cross_attention, \
-                "Streaming only available for causal or cross attention"
-
-        if self.causal:
-            # At the moment we specialize only for the self-attention case.
-            assert query.shape[1] == key.shape[1], "Causal only for same length query / key / value"
-            assert value.shape[1] == key.shape[1], "Causal only for same length query / key / value"
-            attn_mask = self._get_mask(query.shape[1], query.device, query.dtype)
-
-        if self.custom:
-            # custom implementation
-            assert need_weights is False
-            assert key_padding_mask is None
-            if self.cross_attention:
-                # Different queries, keys, values, we have to spit manually the weights
-                # before applying the linear.
-                dim = self.in_proj_weight.shape[0] // 3
-                if self.in_proj_bias is None:
-                    bias_q, bias_k, bias_v = None, None, None
-                else:
-                    bias_q = self.in_proj_bias[:dim]
-                    bias_k = self.in_proj_bias[dim: 2 * dim]
-                    bias_v = self.in_proj_bias[2 * dim:]
-                q = nn.functional.linear(query, self.in_proj_weight[:dim], bias_q)
-                # todo: when streaming, we could actually save k, v and check the shape actually match.
-                k = nn.functional.linear(key, self.in_proj_weight[dim: 2 * dim], bias_k)
-                v = nn.functional.linear(value, self.in_proj_weight[2 * dim:], bias_v)
-                if self.qk_layer_norm is True:
-                    q = self.q_layer_norm(q)
-                    k = self.k_layer_norm(k)
-                q, k, v = [rearrange(x, f"b t (h d) -> {layout}", h=self.num_heads) for x in [q, k, v]]
-            else:
-                if not _is_profiled():
-                    # profiling breaks that propertysomehow.
-                    assert query is key, "specialized implementation"
-                    assert value is key, "specialized implementation"
-                projected = nn.functional.linear(query, self.in_proj_weight, self.in_proj_bias)
-                if self.kv_repeat == 1:
-                    if time_dim == 2:
-                        bound_layout = "b h p t d"
-                    else:
-                        bound_layout = "b t p h d"
-                    packed = rearrange(projected, f"b t (p h d) -> {bound_layout}", p=3, h=self.num_heads)
-                    q, k, v = ops.unbind(packed, dim=2)
-                else:
-                    embed_dim = self.embed_dim
-                    per_head_dim = (embed_dim // self.num_heads)
-                    kv_heads = self.num_heads // self.kv_repeat
-                    q = projected[:, :, :embed_dim]
-                    start = embed_dim
-                    end = start + per_head_dim * kv_heads
-                    k = projected[:, :, start: end]
-                    v = projected[:, :, end:]
-                    q = rearrange(q, f"b t (h d) -> {layout}", h=self.num_heads)
-                    k = rearrange(k, f"b t (h d) -> {layout}", h=kv_heads)
-                    v = rearrange(v, f"b t (h d) -> {layout}", h=kv_heads)
-
-                if self.qk_layer_norm is True:
-                    assert self.kv_repeat == 1
-                    q, k = [rearrange(x, f"{layout} -> b t (h d)") for x in [q, k]]
-                    q = self.q_layer_norm(q)
-                    k = self.k_layer_norm(k)
-                    q, k = [rearrange(x, f"b t (h d) -> {layout}", h=self.num_heads) for x in [q, k]]
-                if self.rope:
-                    q, k = self._apply_rope(q, k)
-                k, v = self._complete_kv(k, v)
-                if self.kv_repeat > 1:
-                    k = expand_repeated_kv(k, self.kv_repeat, self.memory_efficient)
-                    v = expand_repeated_kv(v, self.kv_repeat, self.memory_efficient)
-            if self.attention_as_float32:
-                q, k, v = [x.float() for x in [q, k, v]]
-            if self.memory_efficient:
-                p = self.dropout if self.training else 0
-                if _efficient_attention_backend == 'torch':
-                    x = torch.nn.functional.scaled_dot_product_attention(
-                        q, k, v, is_causal=attn_mask is not None, dropout_p=p)
-                else:
-                    x = ops.memory_efficient_attention(q, k, v, attn_mask, p=p)
-            else:
-                # We include the dot product as float32, for consistency
-                # with the other implementations that include that step
-                # as part of the attention. Note that when using `autocast`,
-                # the einsums would be done as bfloat16, but the softmax
-                # would be done as bfloat16, so `attention_as_float32` will
-                # extend a bit the range of operations done in float32,
-                # although this should make no difference.
-                q = q / q.shape[-1] ** 0.5
-                key_layout = layout.replace('t', 'k')
-                query_layout = layout
-                if self._is_streaming and self.safe_streaming and q.device.type == 'cuda':
-                    with torch.autocast(device_type=q.device.type, dtype=torch.float32):
-                        pre_w = torch.einsum(f"{query_layout},{key_layout}-> b h t k", q, k)
-                else:
-                    pre_w = torch.einsum(f"{query_layout},{key_layout}-> b h t k", q, k)
-                if attn_mask is not None:
-                    pre_w = pre_w + attn_mask
-                w = torch.softmax(pre_w, dim=-1)
-                w = F.dropout(w, self.dropout, training=self.training).to(v)
-                # Key and value have the same format.
-                x = torch.einsum(f"b h t k, {key_layout} -> {layout}", w, v)
-            x = x.to(dtype)
-            x = rearrange(x, f"{layout} -> b t (h d)", h=self.num_heads)
-            x = self.out_proj(x)
-        else:
-            key, value = self._complete_kv(key, value)
-            if self.attention_as_float32:
-                query, key, value = [x.float() for x in [query, key, value]]
-            x, _ = self.mha(
-                query, key, value, key_padding_mask,
-                need_weights, attn_mask, average_attn_weights)
-            x = x.to(dtype)
-
-        return x, None
-
-
-class StreamingTransformerLayer(nn.TransformerEncoderLayer):
-    """TransformerLayer with Streaming / Causal support.
-    This also integrates cross_attention, when passing `cross_attention=True`,
-    rather than having two separate classes like in PyTorch.
-
-    Args:
-        d_model (int): Dimension of the data.
-        num_heads (int): Number of heads.
-        dim_feedforward (int): Intermediate dimension of FF module.
-        dropout (float): Dropout both for MHA and FF.
-        bias_ff (bool): Use bias for FF.
-        bias_attn (bool): Use bias for MHA.
-        causal (bool): Causal mask applied automatically.
-        past_context (int, optional): Receptive field for the causal mask, infinite if None.
-        custom (bool): Use custom MHA implementation, for testing / benchmarking.
-        memory_efficient (bool): Use xformers based memory efficient attention.
-        attention_as_float32 (bool): Perform the attention as float32
-            (especially important with memory_efficient as autocast won't do this automatically).
-        qk_layer_norm (bool): Layer normalization applied to queries and keys before dot product in attention.
-        qk_layer_norm_cross (bool): Same for the cross attention.
-        cross_attention (bool): If True, expect to get secondary input for cross-attention.
-            Cross attention will use the default MHA, as it typically won't require
-            special treatment.
-        layer_scale (float, optional): If not None, LayerScale will be used with
-            the given value as initial scale.
-        rope (`RotaryEmbedding`, optional): Rope embedding to use.
-        attention_dropout (float, optional): If not None, separate the value of the dimension dropout
-            in FFN and of the attention dropout.
-        kv_repeat (int): If > 1, will repeat keys and queries multiple times (need to divide num_heads).
-            This will lead to faster decoding time on A100 or other GPUs with tensorcore.
-        device (torch.device, optional): Device on which to initialize.
-        dtype (torch.dtype, optional): dtype to use.
-        **kwargs: See `nn.TransformerEncoderLayer`.
-    """
-    def __init__(self, d_model: int, num_heads: int, dim_feedforward: int = 2048, dropout: float = 0.1,
-                 bias_ff: bool = True, bias_attn: bool = True, causal: bool = False,
-                 past_context: tp.Optional[int] = None, custom: bool = False,
-                 memory_efficient: bool = False, attention_as_float32: bool = False,
-                 qk_layer_norm: bool = False, qk_layer_norm_cross: bool = False,
-                 cross_attention: bool = False, layer_scale: tp.Optional[float] = None,
-                 rope: tp.Optional[RotaryEmbedding] = None, attention_dropout: tp.Optional[float] = None,
-                 kv_repeat: int = 1, norm: str = 'layer_norm', device=None, dtype=None, **kwargs):
-        super().__init__(d_model, num_heads, dim_feedforward, dropout,
-                         device=device, dtype=dtype, batch_first=True, **kwargs)
-        factory_kwargs = {'device': device, 'dtype': dtype}
-        # Redefine self_attn to our streaming multi-head attention
-        attn_kwargs: tp.Dict[str, tp.Any] = {
-            'embed_dim': d_model,
-            'num_heads': num_heads,
-            'dropout': dropout if attention_dropout is None else attention_dropout,
-            'bias': bias_attn,
-            'custom': custom,
-            'memory_efficient': memory_efficient,
-            'attention_as_float32': attention_as_float32,
+    def __init__(self, cfg: omegaconf.DictConfig):
+        super().__init__(cfg)
+        # easier access to sampling parameters
+        self.generation_params = {
+            'use_sampling': self.cfg.generate.lm.use_sampling,
+            'temp': self.cfg.generate.lm.temp,
+            'top_k': self.cfg.generate.lm.top_k,
+            'top_p': self.cfg.generate.lm.top_p,
         }
-        self.self_attn: StreamingMultiheadAttention = StreamingMultiheadAttention(
-            causal=causal, past_context=past_context, rope=rope, qk_layer_norm=qk_layer_norm,
-            kv_repeat=kv_repeat, **attn_kwargs, **factory_kwargs)  # type: ignore
-        # Redefine feedforward layers to expose bias parameter
-        self.linear1 = nn.Linear(d_model, dim_feedforward, bias=bias_ff, **factory_kwargs)
-        self.linear2 = nn.Linear(dim_feedforward, d_model, bias=bias_ff, **factory_kwargs)
+        self._best_metric_name: tp.Optional[str] = 'ce'
 
-        self.layer_scale_1: nn.Module
-        self.layer_scale_2: nn.Module
-        if layer_scale is None:
-            self.layer_scale_1 = nn.Identity()
-            self.layer_scale_2 = nn.Identity()
-        else:
-            self.layer_scale_1 = LayerScale(d_model, layer_scale, **factory_kwargs)
-            self.layer_scale_2 = LayerScale(d_model, layer_scale, **factory_kwargs)
-
-        self.cross_attention: tp.Optional[nn.Module] = None
-        if cross_attention:
-            self.cross_attention = StreamingMultiheadAttention(
-                cross_attention=True, qk_layer_norm=qk_layer_norm_cross,
-                **attn_kwargs, **factory_kwargs)
-            # Norm and dropout
-            self.dropout_cross = nn.Dropout(dropout)
-            # eps value matching that used in PyTorch reference implementation.
-            self.norm_cross = nn.LayerNorm(d_model, eps=1e-5, **factory_kwargs)
-            self.layer_scale_cross: nn.Module
-            if layer_scale is None:
-                self.layer_scale_cross = nn.Identity()
+        self._cached_batch_writer = None
+        self._cached_batch_loader = None
+        if cfg.cache.path:
+            if cfg.cache.write:
+                self._cached_batch_writer = CachedBatchWriter(Path(cfg.cache.path))
+                if self.cfg.cache.write_num_shards:
+                    self.logger.warning("Multiple shard cache, best_metric_name will be set to None.")
+                    self._best_metric_name = None
             else:
-                self.layer_scale_cross = LayerScale(d_model, layer_scale, **factory_kwargs)
-        self.norm1 = create_norm_fn(norm, d_model, **factory_kwargs)  # type: ignore
-        self.norm2 = create_norm_fn(norm, d_model, **factory_kwargs)  # type: ignore
+                self._cached_batch_loader = CachedBatchLoader(
+                    Path(cfg.cache.path), cfg.dataset.batch_size, cfg.dataset.num_workers,
+                    min_length=self.cfg.optim.updates_per_epoch or 1)
+                self.dataloaders['original_train'] = self.dataloaders['train']
+                self.dataloaders['train'] = self._cached_batch_loader  # type: ignore
 
-    def _cross_attention_block(self, src: torch.Tensor,
-                               cross_attention_src: torch.Tensor) -> torch.Tensor:
-        assert self.cross_attention is not None
-        # queries are from src, keys and values from cross_attention_src.
-        x = self.cross_attention(
-            src, cross_attention_src, cross_attention_src, need_weights=False)[0]
-        return self.dropout_cross(x)  # type: ignore
+    @staticmethod
+    def get_eval_solver_from_sig(sig: str, dtype: tp.Optional[str] = None,
+                                 device: tp.Optional[str] = None, autocast: bool = True,
+                                 batch_size: tp.Optional[int] = None,
+                                 override_cfg: tp.Optional[tp.Union[dict, omegaconf.DictConfig]] = None,
+                                 **kwargs):
+        """Mostly a convenience function around magma.train.get_solver_from_sig,
+        populating all the proper param, deactivating EMA, FSDP, loading the best state,
+        basically all you need to get a solver ready to "play" with in single GPU mode
+        and with minimal memory overhead.
 
-    def forward(self, src: torch.Tensor, src_mask: tp.Optional[torch.Tensor] = None,  # type: ignore
-                src_key_padding_mask: tp.Optional[torch.Tensor] = None,
-                cross_attention_src: tp.Optional[torch.Tensor] = None):
-        if self.cross_attention is None:
-            assert cross_attention_src is None
+        Args:
+            sig (str): signature to load.
+            dtype (str or None): potential dtype, as a string, i.e. 'float16'.
+            device (str or None): potential device, as a string, i.e. 'cuda'.
+            override_cfg (dict or omegaconf.DictConfig or None): potential device, as a string, i.e. 'cuda'.
+        """
+        from audiocraft import train
+        our_override_cfg: tp.Dict[str, tp.Any] = {'optim': {'ema': {'use': False}}}
+        our_override_cfg['autocast'] = autocast
+        if dtype is not None:
+            our_override_cfg['dtype'] = dtype
+        if device is not None:
+            our_override_cfg['device'] = device
+        if batch_size is not None:
+            our_override_cfg['dataset'] = {'batch_size': batch_size}
+        if override_cfg is None:
+            override_cfg = {}
+        override_cfg = omegaconf.OmegaConf.merge(
+            omegaconf.DictConfig(override_cfg), omegaconf.DictConfig(our_override_cfg))  # type: ignore
+        solver = train.get_solver_from_sig(
+            sig, override_cfg=override_cfg,
+            load_best=True, disable_fsdp=True,
+            ignore_state_keys=['optimizer', 'ema'], **kwargs)
+        solver.model.eval()
+        return solver
+
+    def get_formatter(self, stage_name: str) -> flashy.Formatter:
+        return flashy.Formatter({
+            'lr': '.2E',
+            'ce': '.3f',
+            'ppl': '.3f',
+            'grad_norm': '.3E',
+        }, exclude_keys=['ce_q*', 'ppl_q*'])
+
+    @property
+    def best_metric_name(self) -> tp.Optional[str]:
+        return self._best_metric_name
+
+    def build_model(self) -> None:
+        """Instantiate models and optimizer."""
+        # we can potentially not use all quantizers with which the EnCodec model was trained
+        # (e.g. we trained the model with quantizers dropout)
+        self.compression_model = CompressionSolver.wrapped_model_from_checkpoint(
+            self.cfg, self.cfg.compression_model_checkpoint, device=self.device)
+        assert self.compression_model.sample_rate == self.cfg.sample_rate, (
+            f"Compression model sample rate is {self.compression_model.sample_rate} but "
+            f"Solver sample rate is {self.cfg.sample_rate}."
+            )
+        # ensure we have matching configuration between LM and compression model
+        assert self.cfg.transformer_lm.card == self.compression_model.cardinality, (
+            "Cardinalities of the LM and compression model don't match: ",
+            f"LM cardinality is {self.cfg.transformer_lm.card} vs ",
+            f"compression model cardinality is {self.compression_model.cardinality}"
+        )
+        assert self.cfg.transformer_lm.n_q == self.compression_model.num_codebooks, (
+            "Numbers of codebooks of the LM and compression models don't match: ",
+            f"LM number of codebooks is {self.cfg.transformer_lm.n_q} vs ",
+            f"compression model numer of codebooks is {self.compression_model.num_codebooks}"
+        )
+        self.logger.info("Compression model has %d codebooks with %d cardinality, and a framerate of %d",
+                         self.compression_model.num_codebooks, self.compression_model.cardinality,
+                         self.compression_model.frame_rate)
+        # instantiate LM model
+        self.model: models.LMModel = models.builders.get_lm_model(self.cfg).to(self.device)
+        if self.cfg.fsdp.use:
+            assert not self.cfg.autocast, "Cannot use autocast with fsdp"
+            self.model = self.wrap_with_fsdp(self.model)
+        self.register_ema('model')
+        # initialize optimization
+        self.optimizer = builders.get_optimizer(builders.get_optim_parameter_groups(self.model), self.cfg.optim)
+        self.lr_scheduler = builders.get_lr_scheduler(self.optimizer, self.cfg.schedule, self.total_updates)
+        self.register_stateful('compression_model', 'model', 'optimizer', 'lr_scheduler')
+        self.register_best_state('model')
+        self.autocast_dtype = {
+            'float16': torch.float16, 'bfloat16': torch.bfloat16
+        }[self.cfg.autocast_dtype]
+        self.scaler: tp.Optional[torch.cuda.amp.GradScaler] = None
+        if self.cfg.fsdp.use:
+            need_scaler = self.cfg.fsdp.param_dtype == 'float16'
         else:
-            assert cross_attention_src is not None
-        x = src
-        if self.norm_first:
-            x = x + self.layer_scale_1(
-                self._sa_block(self.norm1(x), src_mask, src_key_padding_mask))
-            if cross_attention_src is not None:
-                x = x + self.layer_scale_cross(
-                    self._cross_attention_block(
-                        self.norm_cross(x), cross_attention_src))
-            x = x + self.layer_scale_2(self._ff_block(self.norm2(x)))
-        else:
-            x = self.norm1(x + self.layer_scale_1(
-                self._sa_block(x, src_mask, src_key_padding_mask)))
-            if cross_attention_src is not None:
-                x = self.norm_cross(
-                    x + self.layer_scale_cross(
-                        self._cross_attention_block(src, cross_attention_src)))
-            x = self.norm2(x + self.layer_scale_2(self._ff_block(x)))
-        return x
+            need_scaler = self.cfg.autocast and self.autocast_dtype is torch.float16
+        if need_scaler:
+            if self.cfg.fsdp.use:
+                from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+                self.scaler = ShardedGradScaler()  # type: ignore
+            else:
+                self.scaler = torch.cuda.amp.GradScaler()
+            self.register_stateful('scaler')
 
+    def build_dataloaders(self) -> None:
+        """Instantiate audio dataloaders for each stage."""
+        self.dataloaders = builders.get_audio_datasets(self.cfg, dataset_type=self.DATASET_TYPE)
 
-class MultimodalInjectionLayer(StreamingTransformerLayer):
-    """
-    一个全新的、多模态注入Transformer层。
-    它继承自 StreamingTransformerLayer 以复用其流式处理能力、自注意力、前馈网络等。
-    但它的 forward 方法被重写，以实现先进的多模态融合策略。
-    """
-    def __init__(self, d_model: int, num_heads: int, dim_feedforward: int, **kwargs):
-        # 1. 初始化父类。causal=True 是必需的，cross_attention=False 因为我们将自己处理
+    def show(self) -> None:
+        """Show the compression model and LM model."""
+        self.logger.info("Compression model:")
+        self.log_model_summary(self.compression_model)
+        self.logger.info("LM model:")
+        self.log_model_summary(self.model)
 
-        mert_dim = kwargs.pop('mert_dim', None) # 使用 .pop()
-        assert mert_dim is not None, "mert_dim must be provided to MultimodalInjectionLayer"
+    def load_state_dict(self, state: dict) -> None:
+        if 'condition_provider' in state:
+            model_state = state['model']
+            condition_provider_state = state.pop('condition_provider')
+            prefix = 'condition_provider.'
+            for key, value in condition_provider_state.items():
+                key = prefix + key
+                assert key not in model_state
+                model_state[key] = value
+        super().load_state_dict(state)
 
-        kwargs.pop('causal', None)
-        kwargs.pop('cross_attention', None)
-
-        super().__init__(d_model, num_heads, dim_feedforward, causal=True, cross_attention=True, **kwargs)
-
-        # mert_dim = kwargs.get('mert_dim')
-        # assert mert_dim is not None, "mert_dim must be provided to MultimodalInjectionLayer"
-        # 2. 为FiLM全局风格调制创建投影层
-
-        self.style_projector = nn.Linear(mert_dim, d_model * 2) # <--- 使用 mert_dim
-        self.norm_style = create_norm_fn(kwargs.get('norm', 'layer_norm'), d_model)
-
-        # 3. 创建三个独立的“专家”交叉注意力模块
-        base_attn_kwargs = {
-            'embed_dim': self.cross_attention.embed_dim, 
-            'num_heads': self.cross_attention.num_heads, 
-            'dropout': self.cross_attention.dropout, 
-            'cross_attention': True,
-            'qk_layer_norm': self.cross_attention.qk_layer_norm # <--- 从父类实例中直接读取！
+    def load_from_pretrained(self, name: str):
+        # TODO: support native HF versions of MusicGen.
+        lm_pkg = models.loaders.load_lm_model_ckpt(name)
+        state: dict = {
+            'best_state': {
+                'model': lm_pkg['best_state'],
+            },
         }
+        return state
 
-        # self.cross_attn_local_vid = StreamingMultiheadAttention(**attn_kwargs)
-        self.cross_attn_global_vid = StreamingMultiheadAttention(**base_attn_kwargs)
-        self.cross_attn_audio_style = StreamingMultiheadAttention(**base_attn_kwargs)
-        
-        # 4. 创建门控网络
-        self.gating_network = nn.Linear(d_model, 3)
+    def _compute_cross_entropy(
+        self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor
+    ) -> tp.Tuple[torch.Tensor, tp.List[torch.Tensor]]:
+        """Compute cross entropy between multi-codebook targets and model's logits.
+        The cross entropy is computed per codebook to provide codebook-level cross entropy.
+        Valid timesteps for each of the codebook are pulled from the mask, where invalid
+        timesteps are set to 0.
 
-        # 5. 创建额外的 LayerNorm
-        self.norm_fused_context = create_norm_fn(kwargs.get('norm', 'layer_norm'), d_model)
+        Args:
+            logits (torch.Tensor): Model's logits of shape [B, K, T, card].
+            targets (torch.Tensor): Target codes, of shape [B, K, T].
+            mask (torch.Tensor): Mask for valid target codes, of shape [B, K, T].
+        Returns:
+            ce (torch.Tensor): Cross entropy averaged over the codebooks
+            ce_per_codebook (list of torch.Tensor): Cross entropy per codebook (detached).
+        """
+        B, K, T = targets.shape
+        assert logits.shape[:-1] == targets.shape
+        assert mask.shape == targets.shape
+        ce = torch.zeros([], device=targets.device)
+        ce_per_codebook: tp.List[torch.Tensor] = []
+        for k in range(K):
+            logits_k = logits[:, k, ...].contiguous().view(-1, logits.size(-1))  # [B x T, card]
+            targets_k = targets[:, k, ...].contiguous().view(-1)  # [B x T]
+            mask_k = mask[:, k, ...].contiguous().view(-1)  # [B x T]
+            ce_targets = targets_k[mask_k]
+            ce_logits = logits_k[mask_k]
+            q_ce = F.cross_entropy(ce_logits, ce_targets)
+            ce += q_ce
+            ce_per_codebook.append(q_ce.detach())
+        # average cross entropy across codebooks
+        ce = ce / K
+        return ce, ce_per_codebook
 
-    def forward(self, src: torch.Tensor, 
-                # --- 新增的、用于多模态融合的上下文参数 ---
-                local_vid_ctx: tp.Optional[torch.Tensor] = None, 
-                global_vid_ctx: tp.Optional[torch.Tensor] = None, 
-                audio_style_seq_ctx: tp.Optional[torch.Tensor] = None,
-                audio_style_global_vec: tp.Optional[torch.Tensor] = None,
-                # --- 父类原有的参数 ---
-                src_mask: tp.Optional[torch.Tensor] = None,
-                src_key_padding_mask: tp.Optional[torch.Tensor] = None):
-        
-        x = src
-        
-        # --- 步骤 1: 自注意力 (复用父类的方法和 pre-norm/post-norm 逻辑) ---
-        if self.norm_first:
-            x = x + self.layer_scale_1(self._sa_block(self.norm1(x), src_mask, src_key_padding_mask))
+    def _prepare_tokens_and_attributes(
+        self, batch: tp.Tuple[torch.Tensor, tp.List[SegmentWithAttributes]],
+        check_synchronization_points: bool = False
+    ) -> tp.Tuple[dict, torch.Tensor, torch.Tensor]:
+        """Prepare input batchs for language model training.
+
+        Args:
+            batch (tuple[torch.Tensor, list[SegmentWithAttributes]]): Input batch with audio tensor of shape [B, C, T]
+                and corresponding metadata as SegmentWithAttributes (with B items).
+            check_synchronization_points (bool): Whether to check for synchronization points slowing down training.
+        Returns:
+            Condition tensors (dict[str, any]): Preprocessed condition attributes.
+            Tokens (torch.Tensor): Audio tokens from compression model, of shape [B, K, T_s],
+                with B the batch size, K the number of codebooks, T_s the token timesteps.
+            Padding mask (torch.Tensor): Mask with valid positions in the tokens tensor, of shape [B, K, T_s].
+        """
+
+        if self._cached_batch_loader is None or self.current_stage != "train":
+            # 1. == 从数据加载器返回的批次中解包数据 ==
+            #    batch 是由 MusicDataset 的 collater 函数打包好的。
+            audio, style_audio, video_list, infos = batch # <--- 修改
+            # 2. == 断言并处理 video_list ==
+            assert isinstance(video_list,list)
+
+            assert len(video_list)==2
+            [local_video, global_video]=video_list
+            
+            # 3. == 将视频张量移动到指定的计算设备 (如 GPU) ==
+            local_video = local_video.to(self.device)
+            global_video = global_video.to(self.device)
+            local_video_tokens = None
+            global_video_tokens = None
+            
+            audio = audio.to(self.device)
+            style_audio = style_audio.to(self.device) # <--- 新增
+            audio_tokens = None
+            
+            
+            assert audio.size(0) == len(infos), (
+                f"Mismatch between number of items in audio batch ({audio.size(0)})",
+                f" and in metadata ({len(infos)})"
+            )
         else:
-            x = self.norm1(x + self.layer_scale_1(self._sa_block(x, src_mask, src_key_padding_mask)))
+            print(f'----------musicgen.py---line264-------')
+            audio = None
+            # In that case the batch will be a tuple coming from the _cached_batch_writer bit below.
+            infos, = batch  # type: ignore
+            assert all([isinstance(info, AudioInfo) for info in infos])
+            assert all([info.audio_tokens is not None for info in infos])  # type: ignore
+            audio_tokens = torch.stack([info.audio_tokens for info in infos]).to(self.device)  # type: ignore
+            audio_tokens = audio_tokens.long()
+            for info in infos:
+                if isinstance(info, MusicInfo):
+                    # Careful here, if you want to use this condition_wav (e.b. chroma conditioning),
+                    # then you must be using the chroma cache! otherwise the code will try
+                    # to use this segment and fail (by that I mean you will see NaN everywhere).
+                    info.self_wav = WavCondition(
+                        torch.full([1, info.channels, info.total_frames], float('NaN')),
+                        length=torch.tensor([info.n_frames]),
+                        sample_rate=[info.sample_rate],
+                        path=[info.meta.path],
+                        seek_time=[info.seek_time])
+                    dataset = get_dataset_from_loader(self.dataloaders['original_train'])
+                    assert isinstance(dataset, MusicDataset), type(dataset)
+                    if dataset.paraphraser is not None and info.description is not None:
+                        # Hackingly reapplying paraphraser when using cache.
+                        info.description = dataset.paraphraser.sample_paraphrase(
+                            info.meta.path, info.description)
 
-        # --- 步骤 2 & 3: 混合专家交叉注意力 ---
-        # (我们假设所有 context 都已被提供)
-        # local_ctx_out = self.cross_attn_local_vid(x, local_vid_ctx, local_vid_ctx)[0]
-        local_ctx_out = self.cross_attention(src, local_vid_ctx, local_vid_ctx)[0] # <-- 使用 self.cross_attention
-        global_ctx_out = self.cross_attn_global_vid(x, global_vid_ctx, global_vid_ctx)[0]
-        style_ctx_out = self.cross_attn_global_vid(x, audio_style_global_vec, audio_style_global_vec)[0]
+        # Now we should be synchronization free.
+        if self.device == "cuda" and check_synchronization_points:
+            torch.cuda.set_sync_debug_mode("warn")
+
+        if audio_tokens is None:
+            with torch.no_grad():
+                audio_tokens, scale = self.compression_model.encode(audio)
+                assert scale is None, "Scaled compression model not supported with LM."
+
+        # create a padding mask to hold valid vs invalid positions
+        padding_mask = torch.ones_like(audio_tokens, dtype=torch.bool, device=audio_tokens.device)
+        # replace encodec tokens from padded audio with special_token_id
+        if self.cfg.tokens.padding_with_special_token:
+            audio_tokens = audio_tokens.clone()
+            padding_mask = padding_mask.clone()
+            token_sample_rate = self.compression_model.frame_rate
+            B, K, T_s = audio_tokens.shape
+            for i in range(B):
+                n_samples = infos[i].n_frames
+                audio_sample_rate = infos[i].sample_rate
+                # take the last token generated from actual audio frames (non-padded audio)
+                valid_tokens = math.floor(float(n_samples) / audio_sample_rate * token_sample_rate)
+                audio_tokens[i, :, valid_tokens:] = self.model.special_token_id
+                padding_mask[i, :, valid_tokens:] = 0
+
+
+        if self.device == "cuda" and check_synchronization_points:
+            torch.cuda.set_sync_debug_mode("default")
+
+        if self._cached_batch_writer is not None and self.current_stage == 'train':
+            assert self._cached_batch_loader is None
+            assert audio_tokens is not None
+            for info, one_audio_tokens in zip(infos, audio_tokens):
+                assert isinstance(info, AudioInfo)
+                if isinstance(info, MusicInfo):
+                    assert not info.joint_embed, "joint_embed and cache not supported yet."
+                    info.self_wav = None
+                assert one_audio_tokens.max() < 2**15, one_audio_tokens.max().item()
+                info.audio_tokens = one_audio_tokens.short().cpu()
+            self._cached_batch_writer.save(infos)
+
+        assert isinstance(video_list,list)
+
+        assert len(video_list)==2
+        # 4. == 返回处理好的数据 ==
+        return style_audio, [local_video, global_video], audio_tokens, padding_mask
+
+    # 这个方法定义了单次训练迭代（一次前向传播 + 一次反向传播）的具体流程。
+    def run_step(self, idx: int, batch: tp.Tuple[torch.Tensor, tp.List[SegmentWithAttributes]], metrics: dict) -> dict:
+        """Perform one training or valid step on a given batch."""
+        check_synchronization_points = idx == 1 and self.device == 'cuda'
+
         
-        all_contexts = torch.stack([local_ctx_out, global_ctx_out, style_ctx_out], dim=2)
-        gate_logits = self.gating_network(x)
-        gates = torch.softmax(gate_logits, dim=-1).unsqueeze(-1)
-        fused_context = (all_contexts * gates).sum(dim=2)
+        # 1. == 调用准备方法，获取格式化的数据 ==
+        style_audio, video_list, audio_tokens, padding_mask = self._prepare_tokens_and_attributes(batch, check_synchronization_points)
+
+        assert isinstance(video_list,list)
+
+        assert len(video_list)==2
+        [local_video, global_video]=video_list
+
+
+
+        self.deadlock_detect.update('tokens_and_conditions')
+
+
+        # # ========== 核心添加：风格随机失活 (Style Dropout) ==========
+        # # 从配置中获取失活概率，如果没有则默认为0 (不启用)
+        # style_dropout_p = self.cfg.optim.get('style_dropout_p', 0.0)
         
-        # 应用残差连接
-        x = self.norm_fused_context(x + fused_context)
+        # reference_audio_for_model = style_audio
+        # apply_style_loss = True # 默认总是计算风格损失
+        
+        # if self.is_training and torch.rand(1).item() < style_dropout_p:
+        #     # 在训练时，以 p 的概率触发
+        #     # a. 将参考音频替换为静音
+        #     reference_audio_for_model = torch.zeros_like(style_audio)
+        #     # b. 在这种情况下，计算风格损失没有意义，将其禁用
+        #     apply_style_loss = False
+        # # =============================================================    
+        reference_audio = style_audio
 
-        # --- 步骤 4: 前馈网络 (复用父类的方法和 pre-norm/post-norm 逻辑) ---
-        if self.norm_first:
-            x = x + self.layer_scale_2(self._ff_block(self.norm2(x)))
-        else:
-            x = self.norm2(x + self.layer_scale_2(self._ff_block(x)))
+        if check_synchronization_points:
+            torch.cuda.set_sync_debug_mode('warn')
 
-        return x
+        with self.autocast:
 
-class StreamingTransformer(StreamingModule):
-    """Transformer with Streaming / Causal support.
+            # 2. == 核心调用：将所有数据送入模型进行前向传播 ==
+            #    这是视频信息真正发挥作用的时刻。
+            assert len(video_list)==2
+            # model_output = self.model.compute_predictions(audio_tokens, [], [local_video, global_video], style_audio)  # type: ignore
+            model_output = self.model.compute_predictions(
+                codes=audio_tokens,
+                conditions=[], # 我们决定不使用文本 attributes
+                condition_tensors_list=[local_video, global_video], # 直接使用 _prepare... 返回的 video_list
+                reference_audio=reference_audio   # 明确地将 style_audio 传给 reference_audio 参数
+            )
+            logits = model_output.logits
+            mask = padding_mask & model_output.mask
 
-    Args:
-        d_model (int): Dimension of the data.
-        num_heads (int): Number of heads.
-        dim_feedforward (int): Intermediate dimension of FF module.
-        dropout (float): Dropout both for MHA and FF.
-        bias_ff (bool): Use bias for FF.
-        bias_attn (bool): Use bias for MHA.
-        causal (bool): Causal mask applied automatically.
-        past_context (int, optional): Receptive field for the causal mask, infinite if None.
-        custom (bool): Use custom MHA implementation, for testing / benchmarking.
-        memory_efficient (bool): Use xformers based memory efficient attention.
-        attention_as_float32 (bool): Perform the attention as float32
-            (especially important with memory_efficient as autocast won't do this automatically).
-        cross_attention (bool): If True, expect to get secondary input for cross-attention.
-        layer_scale (float, optional): If not None, LayerScale will be used
-            with the given value as initial scale.
-        positional_embedding (str): Positional embedding strategy (sin, rope, or sin_rope).
-        max_period (float): Maximum period of the time embedding.
-        positional_scale (float): Scale of positional embedding, set to 0 to deactivate.
-        xpos (bool): Apply xpos exponential decay to positional embedding (rope only).
-        lr (float, optional): learning rate override through the `make_optim_group` API.
-        weight_decay (float, optional): Weight_decay override through the `make_optim_group` API.
-        layer_class: (subclass of `StreamingTransformerLayer): class to use
-            to initialize the layers, allowing further customization outside of AudioCraft.
-        checkpointing (str): Checkpointing strategy to reduce memory usage.
-            No checkpointing if set to 'none'. Per layer checkpointing using PyTorch
-            if set to 'torch' (entire layer checkpointed, i.e. linears are evaluated twice,
-            minimal memory usage, but maximal runtime). Finally, `xformers_default` provide
-            a policy for opting-out some operations of the checkpointing like
-            linear layers and attention, providing a middle ground between speed and memory.
-        device (torch.device, optional): Device on which to initialize.
-        dtype (torch.dtype, optional): dtype to use.
-        **kwargs: See `nn.TransformerEncoderLayer`.
-    """
-    def __init__(self, d_model: int, num_heads: int, num_layers: int, dim_feedforward: int = 2048,
-                 dropout: float = 0.1, bias_ff: bool = True, bias_attn: bool = True,
-                 causal: bool = False, past_context: tp.Optional[int] = None,
-                 custom: bool = False, memory_efficient: bool = False, attention_as_float32: bool = False,
-                 cross_attention: bool = False, layer_scale: tp.Optional[float] = None,
-                 positional_embedding: str = 'sin', max_period: float = 10_000, positional_scale: float = 1.,
-                 xpos: bool = False, lr: tp.Optional[float] = None, weight_decay: tp.Optional[float] = None,
-                 layer_class: tp.Type[StreamingTransformerLayer] = StreamingTransformerLayer,
-                 checkpointing: str = 'none', device=None, dtype=None, **kwargs):
-        super().__init__()
-        assert d_model % num_heads == 0
+            # 计算交叉熵损失（基于预测结果和真实音频tokens）
+            ce, ce_per_codebook = self._compute_cross_entropy(logits, audio_tokens, mask)
+            # 3b. 添加：风格损失计算
+            style_loss = torch.tensor(0.0, device=ce.device, dtype=ce.dtype)
+            lambda_style = self.cfg.optim.get('lambda_style', 0.0)
 
-        self.positional_embedding = positional_embedding
-        self.max_period = max_period
-        self.positional_scale = positional_scale
-        self.weight_decay = weight_decay
-        self.lr = lr
+            if self.is_training and lambda_style > 0:
+                with torch.no_grad():
+                    generated_tokens = torch.argmax(logits.detach(), dim=-1)
+                    generated_audio = self.compression_model.decode(generated_tokens)
+                    
+                    # 假设 resampler 在 __init__ 中被创建为 self.resampler_to_style
+                    if not hasattr(self, 'resampler_to_style'): # 惰性初始化
+                        self.resampler_to_style = torchaudio.transforms.Resample(
+                            orig_freq=self.cfg.sample_rate, 
+                            new_freq=self.model.audio_processor.sampling_rate
+                        ).to(self.device)
+                    
+                    resampled_generated = self.resampler_to_style(generated_audio)
 
-        assert positional_embedding in ['sin', 'rope', 'sin_rope']
-        self.rope: tp.Optional[RotaryEmbedding] = None
-        if self.positional_embedding in ['rope', 'sin_rope']:
-            assert _is_custom(custom, memory_efficient)
-            self.rope = RotaryEmbedding(d_model // num_heads, max_period=max_period,
-                                        xpos=xpos, scale=positional_scale, device=device)
+                style_emb_pred = self.model.compute_audio_emb(resampled_generated)
+                style_emb_target = self.model.compute_audio_emb(style_audio)
+                
+                style_loss = 1 - F.cosine_similarity(style_emb_pred, style_emb_target).mean()
+            
+            # 3c. 组合损失
+            loss = ce + lambda_style * style_loss
 
-        self.checkpointing = checkpointing
+        self.deadlock_detect.update('loss')
 
-        assert checkpointing in ['none', 'torch', 'xformers_default', 'xformers_mm']
-        if self.checkpointing.startswith('xformers'):
-            _verify_xformers_internal_compat()
+        if check_synchronization_points:
+            torch.cuda.set_sync_debug_mode('default')
 
-        self.layers = nn.ModuleList()
-        for idx in range(num_layers):
-            self.layers.append(
-                layer_class(
-                    d_model=d_model, num_heads=num_heads, dim_feedforward=dim_feedforward,
-                    dropout=dropout, bias_ff=bias_ff, bias_attn=bias_attn,
-                    causal=causal, past_context=past_context, custom=custom,
-                    memory_efficient=memory_efficient, attention_as_float32=attention_as_float32,
-                    cross_attention=cross_attention, layer_scale=layer_scale, rope=self.rope,
-                    device=device, dtype=dtype, **kwargs))
-
-        if self.checkpointing != 'none':
-            for layer in self.layers:
-                # see audiocraft/optim/fsdp.py, magic signal to indicate this requires fixing the
-                # backward hook inside of FSDP...
-                layer._magma_checkpointed = True  # type: ignore
-
-    def _apply_layer(self, layer, *args, **kwargs):
-        method = self.checkpointing
-        if method == 'none':
-            return layer(*args, **kwargs)
-        elif method == 'torch':
-            return torch_checkpoint(layer, *args, use_reentrant=False, **kwargs)
-        elif method.startswith('xformers'):
-            from xformers.checkpoint_fairinternal import checkpoint, _get_default_policy
-            if method == 'xformers_default':
-                # those operations will be saved, and not recomputed.
-                # According to Francisco we can get smarter policies but this is a good start.
-                allow_list = [
-                    "xformers.efficient_attention_forward_cutlass.default",
-                    "xformers_flash.flash_fwd.default",
-                    "aten.addmm.default",
-                    "aten.mm.default",
-                ]
-            elif method == 'xformers_mm':
-                # those operations will be saved, and not recomputed.
-                # According to Francisco we can get smarter policies but this is a good start.
-                allow_list = [
-                    "aten.addmm.default",
-                    "aten.mm.default",
-                ]
+        if self.is_training:
+            metrics['lr'] = self.optimizer.param_groups[0]['lr']
+            if self.scaler is not None:
+                loss = self.scaler.scale(loss)
+            self.deadlock_detect.update('scale')
+            if self.cfg.fsdp.use:
+                loss.backward()
+                flashy.distrib.average_tensors(self.model.buffers())
+            elif self.cfg.optim.eager_sync:
+                with flashy.distrib.eager_sync_model(self.model):
+                    loss.backward()
             else:
-                raise ValueError(f"xformers checkpointing xformers policy {method} is not known.")
-            policy_fn = _get_default_policy(allow_list)
-            return checkpoint(layer, *args, policy_fn=policy_fn, **kwargs)
+                # this should always be slower but can be useful
+                # for weird use cases like multiple backwards.
+                loss.backward()
+                flashy.distrib.sync_model(self.model)
+            self.deadlock_detect.update('backward')
+
+            if self.scaler is not None:
+                self.scaler.unscale_(self.optimizer)
+            if self.cfg.optim.max_norm:
+                if self.cfg.fsdp.use:
+                    metrics['grad_norm'] = self.model.clip_grad_norm_(self.cfg.optim.max_norm)  # type: ignore
+                else:
+                    metrics['grad_norm'] = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.cfg.optim.max_norm
+                    )
+            if self.scaler is None:
+                self.optimizer.step()
+            else:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            if self.lr_scheduler:
+                self.lr_scheduler.step()
+            self.optimizer.zero_grad()
+            self.deadlock_detect.update('optim')
+            if self.scaler is not None:
+                scale = self.scaler.get_scale()
+                metrics['grad_scale'] = scale
+            if not loss.isfinite().all():
+                raise RuntimeError("Model probably diverged.")
+
+        metrics['ce'] = ce
+        metrics['ppl'] = torch.exp(ce)
+        metrics['style_loss'] = style_loss
+        metrics['loss'] = loss
+        for k, ce_q in enumerate(ce_per_codebook):
+            metrics[f'ce_q{k + 1}'] = ce_q
+            metrics[f'ppl_q{k + 1}'] = torch.exp(ce_q)
+
+        return metrics
+
+    # 这些方法负责处理生成（推理）任务。
+    @torch.no_grad()
+    def run_generate_step(self, batch: tp.Tuple[torch.Tensor, tp.List[SegmentWithAttributes]],
+                          gen_duration: float, prompt_duration: tp.Optional[float] = None,
+                          remove_prompt: bool = False,
+                          **generation_params) -> dict:
+        """Run generate step on a batch of optional audio tensor and corresponding attributes/video feature.
+
+        Args:
+            batch (tuple[torch.Tensor, list[SegmentWithAttributes]]):
+            use_prompt (bool): Whether to do audio continuation generation with prompt from audio batch.
+            gen_duration (float): Target audio duration for the generation.
+            prompt_duration (float, optional): Duration for the audio prompt to use for continuation.
+            remove_prompt (bool, optional): Whether to remove the prompt from the generated audio.
+            generation_params: Additional generation parameters.
+        Returns:
+            gen_outputs (dict): Generation outputs, consisting in audio, audio tokens from both the generation
+                and the prompt along with additional information.
+        """
+        bench_start = time.time()
+        
+        # 1. == 同样地，从批次中解包数据 ==
+        audio, style_audio, video_list, meta = batch
+        assert isinstance(video_list,list)
+
+        assert len(video_list)==2
+        [local_video, global_video]=video_list
+        # 验证视频与音频的批次大小一致
+        assert audio.size(0) == len(local_video), (
+            f"Mismatch between number of items in audio batch ({audio.size(0)})",
+            f" and in video ({len(meta)})"
+        )
+        assert audio.size(0) == len(global_video), (
+            f"Mismatch between number of items in audio batch ({audio.size(0)})",
+            f" and in video ({len(meta)})"
+        )            
+        local_video_attributes = local_video
+        global_video_attributes = global_video
+        # prepare attributes
+
+        # attributes = [x.to_condition_attributes() for x in meta]
+        # TODO: Add dropout for chroma?
+
+        # prepare audio prompt
+        if prompt_duration is None:
+            prompt_audio = None
         else:
-            raise ValueError(f"Checkpointing method {method} is unknown.")
+            assert prompt_duration < gen_duration, "Prompt duration must be lower than target generation duration"
+            prompt_audio_frames = int(prompt_duration * self.compression_model.sample_rate)
+            prompt_audio = audio[..., :prompt_audio_frames]
 
-    def forward(self, x: torch.Tensor, 
-                *args, **kwargs):
-        B, T, C = x.shape
+        # get audio tokens from compression model
+        assert isinstance(video_list,list)
+        # 准备音频提示（可选，用于续写场景）
+        if prompt_audio is None or prompt_audio.nelement() == 0:
 
-        if 'offsets' in self._streaming_state:
-            offsets = self._streaming_state['offsets']
+            assert len(video_list)==2
+            num_samples = len(local_video_attributes)
+            prompt_tokens = None
+            
         else:
-            offsets = torch.zeros(B, dtype=torch.long, device=x.device)
+            num_samples = None
+            prompt_audio = prompt_audio.to(self.device)
+            prompt_tokens, scale = self.compression_model.encode(prompt_audio)
+            assert scale is None, "Compression model in MusicGen should not require rescaling."
 
-        if self.positional_embedding in ['sin', 'sin_rope']:
-            positions = torch.arange(T, device=x.device).view(1, -1, 1)
-            positions = positions + offsets.view(-1, 1, 1)
-            pos_emb = create_sin_embedding(positions, C, max_period=self.max_period, dtype=x.dtype)
-            x = x + self.positional_scale * pos_emb
+        # 2. == 调用模型的 generate 方法 ==
+        # generate by sampling from the LM
+        with self.autocast:
+            total_gen_len = math.ceil(gen_duration * self.compression_model.frame_rate)
 
-        for layer in self.layers:
-            x = self._apply_layer(layer, x, 
-                *args, **kwargs)
+            assert len(video_list)==2
+            gen_tokens = self.model.generate(
+                prompt_tokens, [local_video_attributes, global_video_attributes], reference_audio=style_audio, max_gen_len=total_gen_len,
+                num_samples=num_samples, **self.generation_params)
 
-        if self._is_streaming:
-            self._streaming_state['offsets'] = offsets + T
+        # 将生成的音频编码解码为音频波形
+        # generate audio from tokens
+        assert gen_tokens.dim() == 3
+        gen_audio = self.compression_model.decode(gen_tokens, None)
+        bench_end = time.time()
+        gen_outputs = {
+            'rtf': (bench_end - bench_start) / gen_duration,
+            'ref_audio': audio,
+            'gen_audio': gen_audio,
+            'gen_tokens': gen_tokens,
+            'prompt_audio': prompt_audio,
+            'prompt_tokens': prompt_tokens,
+        }
+        return gen_outputs
 
-        return x
+    def generate_audio(self) -> dict:
+        """Audio generation stage."""
+        generate_stage_name = f'{self.current_stage}'
+        sample_manager = SampleManager(self.xp)
+        self.logger.info(f"Generating samples in {sample_manager.base_folder}")
+        loader = self.dataloaders['generate']
+        updates = len(loader)
+        lp = self.log_progress(generate_stage_name, loader, total=updates, updates=self.log_updates)
 
-    def make_optim_group(self):
-        group = {"params": list(self.parameters())}
-        if self.lr is not None:
-            group["lr"] = self.lr
-        if self.weight_decay is not None:
-            group["weight_decay"] = self.weight_decay
-        return group
+        dataset = get_dataset_from_loader(loader)
+        dataset_duration = dataset.segment_duration
+        assert dataset_duration is not None
+        assert isinstance(dataset, AudioDataset)
+        target_duration = self.cfg.generate.lm.gen_duration
+        prompt_duration = self.cfg.generate.lm.prompt_duration
+        if target_duration is None:
+            target_duration = dataset_duration
+        if prompt_duration is None:
+            prompt_duration = dataset_duration / 4
+        assert prompt_duration < dataset_duration, (
+            f"Specified prompt duration ({prompt_duration}s) is longer",
+            f" than reference audio duration ({dataset_duration}s)"
+        )
 
+        def get_hydrated_conditions(meta: tp.List[SegmentWithAttributes]):
+            hydrated_conditions = []
+            for sample in [x.to_condition_attributes() for x in meta]:
+                cond_dict = {}
+                for cond_type in sample.__annotations__.keys():
+                    for cond_key, cond_val in getattr(sample, cond_type).items():
+                        if cond_key not in self.model.condition_provider.conditioners.keys():
+                            continue
+                        if is_jsonable(cond_val):
+                            cond_dict[cond_key] = cond_val
+                        elif isinstance(cond_val, WavCondition):
+                            cond_dict[cond_key] = cond_val.path
+                        elif isinstance(cond_val, JointEmbedCondition):
+                            cond_dict[cond_key] = cond_val.text  # only support text at inference for now
+                        else:
+                            # if we reached this point, it is not clear how to log the condition
+                            # so we just log the type.
+                            cond_dict[cond_key] = str(type(cond_val))
+                            continue
+                hydrated_conditions.append(cond_dict)
+            return hydrated_conditions
 
-# special attention related function
+        metrics: dict = {}
+        average = flashy.averager()
+        for batch in lp:
+            audio, style_audio, video_list, meta = batch # <--- 修改
+            assert isinstance(video_list,list)
 
-def _verify_xformers_memory_efficient_compat():
-    try:
-        from xformers.ops import memory_efficient_attention, LowerTriangularMask  # noqa
-    except ImportError:
-        raise ImportError(
-            "xformers is not installed. Please install it and try again.\n"
-            "To install on AWS and Azure, run \n"
-            "FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST='8.0'\\\n"
-            "pip install -U git+https://git@github.com/fairinternal/xformers.git#egg=xformers\n"
-            "To install on FAIR Cluster, run \n"
-            "FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST='6.0;7.0'\\\n"
-            "pip install -U git+https://git@github.com/fairinternal/xformers.git#egg=xformers\n")
+            assert len(video_list)==2
+            local_video = video_list[0]
+            global_video = video_list[1]
+             # 提取视频路径作为生成样本的元数据
+            hydrated_conditions = meta[0].meta.video_path
+            
+            sample_generation_params = {
+                **{f'classifier_free_guidance_{k}': v for k, v in self.cfg.classifier_free_guidance.items()},
+                **self.generation_params
+            }
 
+            # 生成无提示音频（基于视频）
+            if self.cfg.generate.lm.unprompted_samples:
+                if self.cfg.generate.lm.gen_gt_samples:
+                    # get the ground truth instead of generation
+                    self.logger.warn(
+                        "Use ground truth instead of audio generation as generate.lm.gen_gt_samples=true")
+                    gen_unprompted_audio = audio
+                    rtf = 1.
+                else:
+                    gen_unprompted_outputs = self.run_generate_step(
+                        batch, gen_duration=target_duration, prompt_duration=None,
+                        **self.generation_params)
+                    gen_unprompted_audio = gen_unprompted_outputs['gen_audio'].cpu()
+                    rtf = gen_unprompted_outputs['rtf']
+                sample_manager.add_samples(
+                    gen_unprompted_audio, self.epoch, hydrated_conditions,
+                    ground_truth_wavs=audio, generation_args=sample_generation_params)
 
-def _verify_xformers_internal_compat():
-    try:
-        from xformers.checkpoint_fairinternal import checkpoint, _get_default_policy  # noqa
-    except ImportError:
-        raise ImportError(
-            "Francisco's fairinternal xformers is not installed. Please install it and try again.\n"
-            "To install on AWS and Azure, run \n"
-            "FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST='8.0'\\\n"
-            "pip install -U git+https://git@github.com/fairinternal/xformers.git#egg=xformers\n"
-            "To install on FAIR Cluster, run \n"
-            "FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST='6.0;7.0'\\\n"
-            "pip install -U git+https://git@github.com/fairinternal/xformers.git#egg=xformers\n")
+            # 生成有提示音频（基于视频+音频提示）
+            if self.cfg.generate.lm.prompted_samples:
+                gen_outputs = self.run_generate_step(
+                    batch, gen_duration=target_duration, prompt_duration=prompt_duration,
+                    **self.generation_params)
+                gen_audio = gen_outputs['gen_audio'].cpu()
+                prompt_audio = gen_outputs['prompt_audio'].cpu()
+                sample_manager.add_samples(
+                    gen_audio, self.epoch, hydrated_conditions,
+                    prompt_wavs=prompt_audio, ground_truth_wavs=audio,
+                    generation_args=sample_generation_params)
 
+            metrics['rtf'] = rtf
+            metrics = average(metrics)
 
-def _is_custom(custom: bool, memory_efficient: bool):
-    return custom or memory_efficient
+        flashy.distrib.barrier()
+        return metrics
+
+    def generate(self) -> dict:
+        """Generate stage."""
+        self.model.eval()
+        with torch.no_grad():
+            return self.generate_audio()
+
+    def run_epoch(self):
+        if self.cfg.cache.write:
+            if ((self.epoch - 1) % self.cfg.cache.write_num_shards) != self.cfg.cache.write_shard:
+                return
+        super().run_epoch()
+
+    def train(self):
+        """Train stage.
+        """
+        if self._cached_batch_writer is not None:
+            self._cached_batch_writer.start_epoch(self.epoch)
+        if self._cached_batch_loader is None:
+            dataset = get_dataset_from_loader(self.dataloaders['train'])
+            assert isinstance(dataset, AudioDataset)
+            dataset.current_epoch = self.epoch
+        else:
+            self._cached_batch_loader.start_epoch(self.epoch)
+        return super().train()
+
+    def evaluate_audio_generation(self) -> dict:
+        """Evaluate audio generation with off-the-shelf metrics."""
+        evaluate_stage_name = f'{self.current_stage}_generation'
+        # instantiate evaluation metrics, if at least one metric is defined, run audio generation evaluation
+        fad: tp.Optional[eval_metrics.FrechetAudioDistanceMetric] = None
+        kldiv: tp.Optional[eval_metrics.KLDivergenceMetric] = None
+        text_consistency: tp.Optional[eval_metrics.TextConsistencyMetric] = None
+        chroma_cosine: tp.Optional[eval_metrics.ChromaCosineSimilarityMetric] = None
+        should_run_eval = False
+        eval_chroma_wavs: tp.Optional[torch.Tensor] = None
+        if self.cfg.evaluate.metrics.fad:
+            fad = builders.get_fad(self.cfg.metrics.fad).to(self.device)
+            should_run_eval = True
+        if self.cfg.evaluate.metrics.kld:
+            kldiv = builders.get_kldiv(self.cfg.metrics.kld).to(self.device)
+            should_run_eval = True
+        if self.cfg.evaluate.metrics.text_consistency:
+            text_consistency = builders.get_text_consistency(self.cfg.metrics.text_consistency).to(self.device)
+            should_run_eval = True
+        if self.cfg.evaluate.metrics.chroma_cosine:
+            chroma_cosine = builders.get_chroma_cosine_similarity(self.cfg.metrics.chroma_cosine).to(self.device)
+            # if we have predefind wavs for chroma we should purge them for computing the cosine metric
+            has_predefined_eval_chromas = 'self_wav' in self.model.condition_provider.conditioners and \
+                                          self.model.condition_provider.conditioners['self_wav'].has_eval_wavs()
+            if has_predefined_eval_chromas:
+                warn_once(self.logger, "Attempting to run cosine eval for config with pre-defined eval chromas! "
+                                       'Resetting eval chromas to None for evaluation.')
+                eval_chroma_wavs = self.model.condition_provider.conditioners.self_wav.eval_wavs  # type: ignore
+                self.model.condition_provider.conditioners.self_wav.reset_eval_wavs(None)  # type: ignore
+            should_run_eval = True
+
+        def get_compressed_audio(audio: torch.Tensor) -> torch.Tensor:
+            audio_tokens, scale = self.compression_model.encode(audio.to(self.device))
+            compressed_audio = self.compression_model.decode(audio_tokens, scale)
+
+            return compressed_audio[..., :audio.shape[-1]]
+
+        metrics: dict = {}
+        if should_run_eval:
+            loader = self.dataloaders['evaluate']
+            updates = len(loader)
+            lp = self.log_progress(f'{evaluate_stage_name} inference', loader, total=updates, updates=self.log_updates)
+            average = flashy.averager()
+            dataset = get_dataset_from_loader(loader)
+            assert isinstance(dataset, AudioDataset)
+            self.logger.info(f"Computing evaluation metrics on {len(dataset)} samples")
+
+            for idx, batch in enumerate(lp):
+                audio, meta = batch
+                assert all([self.cfg.sample_rate == m.sample_rate for m in meta])
+
+                target_duration = audio.shape[-1] / self.cfg.sample_rate
+                if self.cfg.evaluate.fixed_generation_duration:
+                    target_duration = self.cfg.evaluate.fixed_generation_duration
+
+                gen_outputs = self.run_generate_step(
+                    batch, gen_duration=target_duration,
+                    **self.generation_params
+                )
+                y_pred = gen_outputs['gen_audio'].detach()
+                y_pred = y_pred[..., :audio.shape[-1]]
+
+                normalize_kwargs = dict(self.cfg.generate.audio)
+                normalize_kwargs.pop('format', None)
+                y_pred = torch.stack([normalize_audio(w, **normalize_kwargs) for w in y_pred], dim=0).cpu()
+                y = audio.cpu()  # should already be on CPU but just in case
+                sizes = torch.tensor([m.n_frames for m in meta])  # actual sizes without padding
+                sample_rates = torch.tensor([m.sample_rate for m in meta])  # sample rates for audio samples
+                audio_stems = [Path(m.meta.path).stem + f"_{m.seek_time}" for m in meta]
+
+                if fad is not None:
+                    if self.cfg.metrics.fad.use_gt:
+                        y_pred = get_compressed_audio(y).cpu()
+                    fad.update(y_pred, y, sizes, sample_rates, audio_stems)
+                if kldiv is not None:
+                    if self.cfg.metrics.kld.use_gt:
+                        y_pred = get_compressed_audio(y).cpu()
+                    kldiv.update(y_pred, y, sizes, sample_rates)
+                if text_consistency is not None:
+                    texts = [m.description for m in meta]
+                    if self.cfg.metrics.text_consistency.use_gt:
+                        y_pred = y
+                    text_consistency.update(y_pred, texts, sizes, sample_rates)
+                if chroma_cosine is not None:
+                    if self.cfg.metrics.chroma_cosine.use_gt:
+                        y_pred = get_compressed_audio(y).cpu()
+                    chroma_cosine.update(y_pred, y, sizes, sample_rates)
+                    # restore chroma conditioner's eval chroma wavs
+                    if eval_chroma_wavs is not None:
+                        self.model.condition_provider.conditioners['self_wav'].reset_eval_wavs(eval_chroma_wavs)
+
+            flashy.distrib.barrier()
+            if fad is not None:
+                metrics['fad'] = fad.compute()
+            if kldiv is not None:
+                kld_metrics = kldiv.compute()
+                metrics.update(kld_metrics)
+            if text_consistency is not None:
+                metrics['text_consistency'] = text_consistency.compute()
+            if chroma_cosine is not None:
+                metrics['chroma_cosine'] = chroma_cosine.compute()
+            metrics = average(metrics)
+            metrics = flashy.distrib.average_metrics(metrics, len(loader))
+
+        return metrics
+
+    def evaluate(self) -> dict:
+        """Evaluate stage."""
+        self.model.eval()
+        with torch.no_grad():
+            metrics: dict = {}
+            if self.cfg.evaluate.metrics.base:
+                metrics.update(self.common_train_valid('evaluate'))
+            gen_metrics = self.evaluate_audio_generation()
+            return {**metrics, **gen_metrics}
