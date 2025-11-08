@@ -765,10 +765,6 @@ class StreamingTransformer(StreamingModule):
             raise ValueError(f"Checkpointing method {method} is unknown.")
 
     def forward(self, x: torch.Tensor, 
-                local_vid_ctx: tp.Optional[torch.Tensor] = None, 
-                global_vid_ctx: tp.Optional[torch.Tensor] = None, 
-                audio_style_seq_ctx: tp.Optional[torch.Tensor] = None,
-                audio_style_global_vec: tp.Optional[torch.Tensor] = None,
                 *args, **kwargs):
         B, T, C = x.shape
 
@@ -785,10 +781,6 @@ class StreamingTransformer(StreamingModule):
 
         for layer in self.layers:
             x = self._apply_layer(layer, x, 
-                local_vid_ctx=local_vid_ctx,
-                global_vid_ctx=global_vid_ctx,
-                audio_style_seq_ctx=audio_style_seq_ctx,
-                audio_style_global_vec=audio_style_global_vec,
                 *args, **kwargs)
 
         if self._is_streaming:
