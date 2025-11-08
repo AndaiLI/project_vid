@@ -80,7 +80,7 @@ optim:
   optimizer: adamw
   lr: 1e-5
   lambda_style: 1 
-  style_dropout_p: 0
+  # style_dropout_p: 0
   ema:
     use: true         # whether to use EMA or not
     updates: 10        # update at every step
