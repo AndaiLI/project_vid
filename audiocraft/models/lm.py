@@ -273,19 +273,19 @@ class LMModel(StreamingModule):
             for param in self.audio_encoder_model.parameters():
                 param.requires_grad = False
 
-        self.audio_style_processor = Transformer(
-            audio_feature_dim, depth, num_heads, dim_head, audio_feature_dim * hidden_scale, 0.
-        )
+        # self.audio_style_processor = Transformer(
+        #     audio_feature_dim, depth, num_heads, dim_head, audio_feature_dim * hidden_scale, 0.
+        # )
         self.audio_feature_proj = nn.Linear(audio_feature_dim, dim)
 
-
-        mert_dim = self.audio_encoder_model.config.hidden_size
-        kwargs['mert_dim'] = mert_dim 
+        # mert_dim = self.audio_encoder_model.config.hidden_size
+        # kwargs['mert_dim'] = mert_dim 
+        self.final_fusion_cross_attn = MultiHeadCrossAttention(dim, num_heads)
         
         self.transformer = StreamingTransformer(
             d_model=dim, num_heads=num_heads, dim_feedforward=int(hidden_scale * dim),
             norm=norm, norm_first=norm_first, 
-            layer_class=MultimodalInjectionLayer,
+            # layer_class=MultimodalInjectionLayer,
             **kwargs) 
         
         
@@ -327,6 +327,8 @@ class LMModel(StreamingModule):
                 self.global_pos_embedding = nn.Parameter(torch.randn(1, 50, temporal_dim))
 
             self.global_temporal_transformer = Transformer(temporal_dim, depth, num_heads, dim_head, temporal_dim*hidden_scale, 0.) # [768, 4, 16, 64, 768*4]
+            cross_attention_num_heads = 3 # MultiHeadCrossAttention
+            self.multi_head_cross_attention = MultiHeadCrossAttention(temporal_dim, cross_attention_num_heads)
             
         self.visual_feature_proj = nn.Linear(temporal_dim, dim)                       
 
@@ -438,7 +440,10 @@ class LMModel(StreamingModule):
                 b=global_batch_size, t=global_time_length
             )
 
-        return local_video_hidden, global_video_hidden
+        video_hidden = self.multi_head_cross_attention(local_video_hidden, global_video_hidden)
+        video_emb = self.visual_feature_proj(video_hidden)
+
+        return video_emb
 
         # # 4. 融合局部和全局特征
         # video_hidden = self.multi_head_cross_attention(local_video_hidden, global_video_hidden)
@@ -446,7 +451,7 @@ class LMModel(StreamingModule):
         # video_emb = self.visual_feature_proj(video_hidden)
         # return video_emb
 
-    def compute_audio_emb(self, reference_audio: torch.Tensor) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+    def compute_audio_emb(self, reference_audio: torch.Tensor) -> torch.Tensor:
         """
         [修改后]
         计算并返回音频的全局风格向量和经过时序建模的风格特征序列。
@@ -490,9 +495,9 @@ class LMModel(StreamingModule):
 
         global_audio_vector = audio_feat_sequence.mean(dim=1) # -> 形状 [B, D_mert]
 
-        audio_style_sequence = self.audio_style_processor(audio_feat_sequence) # -> 形状 [B, T_a, D_mert]
+        # audio_style_sequence = self.audio_style_processor(audio_feat_sequence) # -> 形状 [B, T_a, D_mert]
 
-        return global_audio_vector, audio_style_sequence
+        return global_audio_vector
 
 
 
@@ -514,63 +519,42 @@ class LMModel(StreamingModule):
         self.device = input_.device
         assert self.device != "cpu"
 
-        # a. 如果没有预计算的视频嵌入，就实时计算
         if precomputed_video_emb is None:
             assert video_tensor_list is not None
-            raw_local_vid, raw_global_vid = self.compute_video_emb(video_tensor_list, self.device)
-            # video_emb = self.compute_video_emb(video_tensor_list, device=self.device)
+            video_emb = self.compute_video_emb(video_tensor_list, self.device) # -> [B, T_v, D]
         else:
-            # 在生成模式下，使用预先计算好的嵌入
-            raw_local_vid, raw_global_vid = precomputed_video_emb
-            # video_emb = precomputed_video_emb
+            video_emb = precomputed_video_emb
 
-        # 对视频特征进行最终的投影
-        local_vid_ctx = self.visual_feature_proj(raw_local_vid)
-        global_vid_ctx = self.visual_feature_proj(raw_global_vid)
-
-        # b. 计算音频嵌入 (调用我们新写的方法)
+        # ========== 2. 准备音频嵌入 (保持不变) ==========
+        # 解释: 我们仍然需要计算全局音频向量，并将其投影和 unsqueeze。
         if precomputed_audio_emb is None:
-            # audio_emb = self.compute_audio_emb(reference_audio)
             assert reference_audio is not None
-            global_audio_vec_raw, raw_audio_seq = self.compute_audio_emb(reference_audio)
+            raw_audio_global_vec = self.compute_audio_emb(reference_audio) # -> [B, D_mert]
         else:
-            # audio_emb = precomputed_audio_emb
-            global_audio_vec_raw, raw_audio_seq = precomputed_audio_emb
+            raw_audio_global_vec = precomputed_audio_emb
 
-        # 对音频序列特征进行最终的投影
-        projected_global_audio_vec = self.audio_feature_proj(global_audio_vec_raw)
-        #audio_style_seq_ctx = self.audio_feature_proj(raw_audio_seq)
-        # 用于FiLM的全局向量，在送入style_projector前不需要投影
-        audio_style_global_ctx = projected_global_audio_vec.unsqueeze(1)
-        # global_audio_vec = global_audio_vec_raw
+        audio_emb = self.audio_feature_proj(raw_audio_global_vec) # -> [B, D]
+        audio_emb_ctx = audio_emb.unsqueeze(1) # -> [B, 1, D]
+
+        # ========== 3. 核心修改：最终的“串联”融合 ==========
+        # 解释: 让已经完全处理好的视频嵌入(video_emb)，去查询音频风格嵌入(audio_emb_ctx)。
+        #       我们复用了 VidMuse 内部的 MultiHeadCrossAttention 类。
+        fusion_out = self.final_fusion_cross_attn(video_emb, audio_emb_ctx)
 
         out = self.transformer(
             x=input_,
-            local_vid_ctx=local_vid_ctx,
-            global_vid_ctx=global_vid_ctx,
-            #audio_style_seq_ctx=audio_style_seq_ctx,
-            audio_style_global_vec=audio_style_global_ctx,
+            cross_attention_src=fusion_out
         )
-        # --- 4. 输出处理 (逻辑不变) ---
+        
+        # ========== 5. 输出处理 (不变) ==========
         if self.out_norm:
             out = self.out_norm(out)
         logits = torch.stack([self.linears[k](out) for k in range(K)], dim=1)
-        # 对齐 logits 长度 (如果需要)
-        # 这里的 fuser 检查可能需要调整，因为我们现在没有主动使用它来处理交叉注意力
-        # 为了安全，我们暂时注释掉或简化它
-        # if 'fuser' in self.__dict__ and len(self.fuser.fuse2cond['prepend']) > 0:
-        #     logits = logits[:, :, -S:]
-        return logits
-        # --- 4. 输出处理 (逻辑不变) ---
-        if self.out_norm:
-            out = self.out_norm(out)
-        logits = torch.stack([self.linears[k](out) for k in range(K)], dim=1)
-        # 对齐 logits 长度 (如果需要)
-        # 这里的 fuser 检查可能需要调整，因为我们现在没有主动使用它来处理交叉注意力
-        # 为了安全，我们暂时注释掉或简化它
-        # if 'fuser' in self.__dict__ and len(self.fuser.fuse2cond['prepend']) > 0:
-        #     logits = logits[:, :, -S:]
-        return logits
+
+        if len(self.fuser.fuse2cond['prepend']) > 0:
+            logits = logits[:, :, -S:]
+        return logits  # [B, K, S, card]
+
 
 
 
